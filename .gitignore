@@ -17,3 +17,10 @@ env/
 *.log
 
 *.db
+
+# Data files (stored in Supabase Storage)
+data/faiss/*.index
+data/faiss/*.chunks.json
+data/faiss.zip
+data/textbooks/*
+!data/textbooks/.gitkeep

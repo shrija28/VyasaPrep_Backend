@@ -18,6 +18,7 @@ straight read of the file.
 """
 
 import os
+import uuid
 
 import hmac
 from datetime import datetime, timedelta, timezone
@@ -27,7 +28,7 @@ import os
 from flask import Blueprint, request, g, make_response, jsonify, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -86,7 +87,7 @@ def _set_session_cookie(response, token: str, max_age: int)-> None:
     )
 
 
-def _clear_session_cookie()-> None:
+def _clear_session_cookie(response)-> None:
     response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
 
 
@@ -606,8 +607,9 @@ def logout()-> Any:
                 session.commit()
                 revoked = True
 
-    _clear_session_cookie(response)
-    return {"logged_out": True, "revoked": revoked}
+    resp = make_response(jsonify({"logged_out": True, "revoked": revoked}))
+    _clear_session_cookie(resp)
+    return resp
 
 
 # GET /api/auth/me
@@ -652,13 +654,12 @@ def me()-> Any:
 
     # For students, always re-read from DB to get current subtype/institution
     if role == "student":
-        user = session.execute(
-            select(User).where(
-                (User.kcet_student_id == sub)
-                | (User.kcet_student_id == sub.replace("KCET", "VP").replace("ID", "VP"))
-                | (User.kcet_student_id == sub.replace("VP", "MrE"))
-            )
-        ).scalars().first()
+        try:
+            sub_uuid = uuid.UUID(str(sub))
+            stmt = select(User).where(or_(User.kcet_student_id == sub, User.email == sub, User.id == sub_uuid))
+        except (ValueError, TypeError):
+            stmt = select(User).where(or_(User.kcet_student_id == sub, User.email == sub))
+        user = session.execute(stmt).scalars().first()
         if user:
             result["display_name"] = user.display_name
             result["kcet_student_id"] = user.kcet_student_id or sub

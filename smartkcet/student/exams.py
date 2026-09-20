@@ -42,13 +42,13 @@ router = Blueprint("student_exams", __name__)
 # ---------------------------------------------------------------------------
 
 
-def _validation_error(message: str, field: Optional[str] = None)-> JSONResponse:
+def _validation_error(message: str, field: Optional[str] = None)-> Any:
     """Return a 400 envelope identical in shape to the admin endpoints."""
 
     body: dict[str, Any] = {"error": "validation_error", "message": message}
     if field is not None:
         body["field"] = field
-    return JSONResponse(status_code=400, content=body)
+    return make_response(jsonify(body), 400)
 
 
 def _normalise_subject(value: Optional[str])-> Optional[Subject]:
@@ -129,9 +129,19 @@ def list_published_exams()-> Any:
             )
         selected = normalised
 
-    # Get student's institution_id and subtype from token payload
+    from ..middleware.rbac import current_user
+    user = current_user(request, session)
+
     student_institution_id = _student.get("institution_id")
-    student_subtype = _student.get("student_subtype", "direct_subscriber")
+    student_subtype = _student.get("student_subtype")
+
+    if user and user.institution_id:
+        student_institution_id = str(user.institution_id)
+        student_subtype = "institution_linked"
+    elif student_institution_id:
+        student_subtype = "institution_linked"
+    else:
+        student_subtype = "direct_subscriber"
 
     stmt = (
         select(Exam, func.count(ExamSet.id).label("set_count"))
@@ -162,32 +172,29 @@ def list_published_exams()-> Any:
 
     rows = session.execute(stmt).all()
 
-    # Group rows by subject.  ``buckets`` preserves insertion order so a
-    # subject's first-seen ``created_at`` decides where it appears in
-    # the response — combined with the SQL ``ORDER BY created_at DESC``
-    # this mirrors the admin-list ordering.
+    exam_ids = [exam.id for exam, _ in rows]
+    all_exam_sets: dict[uuid.UUID, list[ExamSet]] = {}
+    if exam_ids:
+        sets_rows = session.execute(
+            select(ExamSet)
+            .where(ExamSet.exam_id.in_(exam_ids))
+            .order_by(ExamSet.set_label.asc())
+        ).scalars().all()
+        for es in sets_rows:
+            all_exam_sets.setdefault(es.exam_id, []).append(es)
+
     buckets: dict[str, list[dict[str, Any]]] = {}
     for exam, set_count in rows:
         created_at = exam.created_at
 
-        # Fetch the actual exam sets for this exam so the UI can link directly
-        sets_stmt = (
-            select(ExamSet)
-            .where(ExamSet.exam_id == exam.id)
-            .order_by(ExamSet.set_label.asc())
-        )
-        exam_sets = session.execute(sets_stmt).scalars().all()
+        exam_sets = all_exam_sets.get(exam.id, [])
         sets_payload = [
             {"exam_set_id": str(es.id), "set_label": es.set_label}
             for es in exam_sets
         ]
 
         # Deterministically assign set based on student ID (e.g. KCET0001 -> Set A, KCET0002 -> Set B, etc.)
-        student_id_str = ""
-        if user:
-            student_id_str = user.kcet_student_id or str(user.id)
-        else:
-            student_id_str = _student.get("kcet_student_id") or _student.get("sub") or ""
+        student_id_str = str(_student.get("kcet_student_id") or _student.get("sub") or "")
 
         import re as _re
         digits = _re.findall(r'\d+', student_id_str)
@@ -216,9 +223,9 @@ def list_published_exams()-> Any:
                     created_at.isoformat() if created_at is not None else None
                 ),
                 "set_count": len(sets_payload) or int(set_count or 0),
-                "question_count": questions_per_set,
+                "question_count": getattr(exam, 'questions_per_set', 60) or 60,
                 "duration_minutes": exam.duration_minutes or 60,
-                "total_marks": exam.total_marks or (questions_per_set * 1 if questions_per_set else 60),
+                "total_marks": exam.total_marks or 60,
                 "scheduled_start": exam.scheduled_start.isoformat() if exam.scheduled_start else None,
                 "scheduled_end": exam.scheduled_end.isoformat() if exam.scheduled_end else None,
                 "institution_id": str(exam.institution_id) if exam.institution_id else None,

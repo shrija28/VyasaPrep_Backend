@@ -24,7 +24,9 @@ We defer embedder initialization until first use via a lazy loader.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Union
 
@@ -76,10 +78,36 @@ embedder = _EmbedderProxy()
 # the path-resolution pattern used by ``smartkcet.db.session``.
 _BACKEND_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_FAISS_DIR = _BACKEND_ROOT / "data" / "faiss"
+_SUPABASE_BUCKET = os.getenv("SUPABASE_FAISS_BUCKET", "vyasaprep-faiss")
+_supabase_client: Optional[object] = None
+_supabase_load_attempted = False
 
 # Type alias for inputs that select a subject.  Callers may pass either a
 # ``Subject`` enum value or its string name; both are normalised internally.
 SubjectLike = Union[Subject, str]
+
+
+def _get_supabase_client():
+    """Return a configured Supabase client, or ``None`` when disabled."""
+
+    global _supabase_client, _supabase_load_attempted
+    if _supabase_client is not None:
+        return _supabase_client
+    if _supabase_load_attempted:
+        return None
+
+    _supabase_load_attempted = True
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        return None
+
+    try:
+        from supabase import create_client
+        _supabase_client = create_client(url, key)
+    except Exception:
+        _supabase_client = None
+    return _supabase_client
 
 
 class VectorStore:
@@ -170,6 +198,52 @@ class SubjectVectorStores:
     def _ensure_data_dir(self)-> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _remote_paths(subject: Subject)-> tuple[str, str]:
+        prefix = subject.value
+        return f"{prefix}.index", f"{prefix}.chunks.json"
+
+    def _load_local(self, subject: Subject)-> Optional[VectorStore]:
+        idx_path = self._index_path(subject)
+        chunks_path = self._chunks_path(subject)
+        if not (idx_path.exists() and chunks_path.exists()):
+            return None
+
+        try:
+            vs = VectorStore()
+            vs.index = faiss.read_index(str(idx_path))
+            with chunks_path.open("r", encoding="utf-8") as fp:
+                chunks = json.load(fp)
+            if not isinstance(chunks, list) or vs.index.ntotal != len(chunks):
+                return None
+            vs.chunks = [str(c) for c in chunks]
+            return vs
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+    def _load_remote(self, subject: Subject)-> Optional[VectorStore]:
+        client = _get_supabase_client()
+        if client is None:
+            return None
+
+        index_name, chunks_name = self._remote_paths(subject)
+        try:
+            storage = client.storage.from_(_SUPABASE_BUCKET)
+            index_bytes = storage.download(index_name)
+            chunks_bytes = storage.download(chunks_name)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                index_path = Path(temp_dir) / index_name
+                index_path.write_bytes(index_bytes)
+                vs = VectorStore()
+                vs.index = faiss.read_index(str(index_path))
+            chunks = json.loads(chunks_bytes.decode("utf-8"))
+            if not isinstance(chunks, list) or vs.index.ntotal != len(chunks):
+                return None
+            vs.chunks = [str(c) for c in chunks]
+            return vs
+        except Exception:
+            return None
+
     def _load(self, subject: Subject)-> VectorStore:
         """Read the persisted index + chunks for ``subject`` from disk.
 
@@ -177,30 +251,29 @@ class SubjectVectorStores:
         files exist; otherwise returns a fresh empty store.
         """
 
-        vs = VectorStore()
-        idx_path = self._index_path(subject)
-        chunks_path = self._chunks_path(subject)
-        if idx_path.exists() and chunks_path.exists():
-            try:
-                vs.index = faiss.read_index(str(idx_path))
-                with chunks_path.open("r", encoding="utf-8") as fp:
-                    chunks = json.load(fp)
-                if isinstance(chunks, list):
-                    vs.chunks = [str(c) for c in chunks]
-            except (OSError, ValueError, RuntimeError):
-                # Corrupt or unreadable persisted state — start clean
-                # rather than crash the whole RAG service.
-                vs = VectorStore()
-        return vs
+        return self._load_local(subject) or self._load_remote(subject) or VectorStore()
 
     def _persist(self, subject: Subject, vs: VectorStore)-> None:
-        """Write the in-memory state for ``subject`` to disk."""
+        """Persist a subject locally, and to Supabase when configured."""
 
-        self._ensure_data_dir()
-        if vs.index is not None:
-            faiss.write_index(vs.index, str(self._index_path(subject)))
-        with self._chunks_path(subject).open("w", encoding="utf-8") as fp:
-            json.dump(vs.chunks, fp, ensure_ascii=False)
+        client = _get_supabase_client()
+        if client is None:
+            self._ensure_data_dir()
+            if vs.index is not None:
+                faiss.write_index(vs.index, str(self._index_path(subject)))
+            with self._chunks_path(subject).open("w", encoding="utf-8") as fp:
+                json.dump(vs.chunks, fp, ensure_ascii=False)
+            return
+
+        index_name, chunks_name = self._remote_paths(subject)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            index_path = Path(temp_dir) / index_name
+            faiss.write_index(vs.index, str(index_path))
+            chunks_bytes = json.dumps(vs.chunks, ensure_ascii=False).encode("utf-8")
+            storage = client.storage.from_(_SUPABASE_BUCKET)
+            options = {"upsert": "true"}
+            storage.upload(index_name, index_path.read_bytes(), options)
+            storage.upload(chunks_name, chunks_bytes, options)
 
     def _get(self, subject: Subject)-> VectorStore:
         """Return the cached store for ``subject``, lazy-loading on miss."""
@@ -239,11 +312,14 @@ class SubjectVectorStores:
         s = self._normalize(subject)
         vs = self._get(s)
         vs.reset()
-        for path in (self._index_path(s), self._chunks_path(s)):
+        client = _get_supabase_client()
+        if client is not None:
             try:
-                path.unlink()
-            except FileNotFoundError:
+                client.storage.from_(_SUPABASE_BUCKET).remove(list(self._remote_paths(s)))
+            except Exception:
                 pass
+        for path in (self._index_path(s), self._chunks_path(s)):
+            path.unlink(missing_ok=True)
 
     def reset_all(self)-> None:
         """Clear every subject's state. Useful for tests and admin reset."""

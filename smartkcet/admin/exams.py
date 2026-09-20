@@ -413,21 +413,19 @@ def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, se
 
     # ── Step 2: Fall back to pre-indexed FAISS textbook chunks if no files uploaded
     if not chapter_texts:
-        chunk_file = FAISS_DIR / f"{subject_name}.chunks.json"
-        if chunk_file.exists():
-            try:
-                with open(chunk_file, "r", encoding="utf-8") as f:
-                    all_chunks = json.load(f)
-                if all_chunks and isinstance(all_chunks, list):
-                    # Sample chunks across the textbook
-                    sample_count = min(30, len(all_chunks))
-                    step = max(1, len(all_chunks) // sample_count)
-                    sampled = [all_chunks[i] for i in range(0, len(all_chunks), step)][:sample_count]
-                    joined_text = "\n\n".join(sampled)
-                    chapter_texts.append((f"{subject_name} NCERT Textbook", joined_text))
-                    logger.info("Loaded %d textbook chunks from %s for RAG exam", len(sampled), chunk_file.name)
-            except Exception as exc:
-                logger.warning("Failed to load pre-indexed chunks for %s: %s", subject_name, exc)
+        try:
+            from ..rag.store import stores
+            all_chunks = stores._get(selected).chunks
+            if all_chunks and isinstance(all_chunks, list):
+                # Sample chunks across the textbook
+                sample_count = min(30, len(all_chunks))
+                step = max(1, len(all_chunks) // sample_count)
+                sampled = [all_chunks[i] for i in range(0, len(all_chunks), step)][:sample_count]
+                joined_text = "\n\n".join(sampled)
+                chapter_texts.append((f"{subject_name} NCERT Textbook", joined_text))
+                logger.info("Loaded %d textbook chunks from store for %s RAG exam", len(sampled), subject_name)
+        except Exception as exc:
+            logger.warning("Failed to load chunks from store for %s: %s", subject_name, exc)
 
     # If still no textbook content, provide a friendly message
     if not chapter_texts:

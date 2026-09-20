@@ -157,6 +157,9 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
         q_text = mcq.get("q", "").strip()
         opts = mcq.get("opts", [])
         ans = mcq.get("ans", 0)
+        ans_str = str(ans).strip()
+        if ans_str.lower() in ("a", "b", "c", "d"):
+            ans_str = str({"a": 0, "b": 1, "c": 2, "d": 3}[ans_str.lower()])
         topic = mcq.get("topic", "General")
 
         # Validate
@@ -167,7 +170,7 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
             subject=subject,
             question_text=q_text,
             options=opts,
-            correct_option=str(ans),
+            correct_option=ans_str,
             topic=topic if isinstance(topic, str) else "General",
             generation_batch_id=batch_id,
             institution_id=None,  # platform-wide

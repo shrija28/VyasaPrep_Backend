@@ -17,8 +17,10 @@ from uuid import UUID
 import os
 from flask import Blueprint, request, g, make_response, jsonify, Response
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 
-from ..db.models import User
+from fastapi import HTTPException
+from ..db.models import Exam, ExamSet, IndexedFile, Question, Submission, User
 from ..db.session import get_async_session as get_session
 from ..db.subscription_models import Institution, Subscription, SubscriptionPlan
 from ..middleware.rbac import require_authenticated
@@ -50,34 +52,37 @@ router = Blueprint("institution_routes", __name__)
 router.register_blueprint(content.router, tags=["institution-content"])
 
 
-def require_institution_admin()-> dict:    
+def require_institution_admin()-> dict:
     payload = require_authenticated()
-    
-    payload = require_authenticated()
-    """Require institution_admin role and inject institution_id.
-    
-    Raises:
-        HTTPException: 403 if not an institution admin
-    """
-    if payload.get("role") != "institution_admin":
+    if payload.get("role") not in ("institution_admin", "platform_admin", "admin"):
         raise HTTPException(
             status_code=403,
-            detail={
-                "error": "forbidden",
-                "message": "Institution admin access required",
-            },
+            detail={"error": "forbidden", "message": "Institution admin access required"},
         )
-    
-    # Ensure institution_id is present in payload
-    if "institution_id" not in payload:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "forbidden",
-                "message": "Institution ID not found in token",
-            },
-        )
-    
+    from flask import request
+    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+    if req_inst and str(req_inst).strip().lower() != "all":
+        raw = str(req_inst).strip()
+        from flask import g
+        db = getattr(g, "db", None)
+        if db:
+            from ..db.subscription_models import Institution
+            from sqlalchemy import func
+            inst = db.query(Institution).filter(func.lower(Institution.name) == raw.lower()).first()
+            if inst:
+                payload["institution_id"] = str(inst.id)
+            else:
+                payload["institution_id"] = raw
+        else:
+            payload["institution_id"] = raw
+    elif "institution_id" not in payload or not payload.get("institution_id"):
+        from flask import g
+        db = getattr(g, "db", None)
+        if db:
+            from ..db.subscription_models import Institution
+            first_inst = db.query(Institution).first()
+            if first_inst:
+                payload["institution_id"] = str(first_inst.id)
     return payload
 
 
@@ -732,6 +737,35 @@ def get_institution_dashboard():
         tests_this_week = test_attempts_week + exams_created_week
         tests_this_month = test_attempts_month + exams_created_month
 
+        # Live dynamic counts as entries occur
+        total_questions = db.query(Question).filter(
+            Question.institution_id == institution_id
+        ).count()
+
+        from sqlalchemy import func
+        q_by_sub_rows = (
+            db.query(Question.subject, func.count(Question.id))
+            .filter(Question.institution_id == institution_id)
+            .group_by(Question.subject)
+            .all()
+        )
+        questions_by_subject = {row[0]: int(row[1]) for row in q_by_sub_rows}
+
+        total_exams = db.query(Exam).filter(
+            Exam.institution_id == institution_id
+        ).count()
+
+        total_files = db.query(IndexedFile).filter(
+            IndexedFile.institution_id == institution_id
+        ).count()
+
+        total_attempts = (
+            db.query(Submission)
+            .filter(Submission.user_id.in_(all_user_ids))
+            .count()
+            if all_user_ids else 0
+        )
+
         return {
             "institution_id": str(institution_id),
             "institution_name": institution.name,
@@ -743,6 +777,11 @@ def get_institution_dashboard():
             "monthly_test_limit": monthly_test_limit,
             "tests_this_week": tests_this_week,
             "tests_this_month": tests_this_month,
+            "total_questions": total_questions,
+            "questions_by_subject": questions_by_subject,
+            "total_exams": total_exams,
+            "total_files": total_files,
+            "total_attempts": total_attempts,
             "recent_submissions": recent_submissions,
         }
     
@@ -1079,40 +1118,39 @@ def get_institution_student_exams():
     Platform-wide exams (institution_id IS NULL) are NOT shown.
     Strict isolation: no cross-institution access.
     """
-    if payload.get("role") != "student" or payload.get("student_subtype") != "institution_linked":
-        raise HTTPException(
-            status_code=403,
-            detail={"error": "forbidden", "message": "Institution students only"},
-        )
-
-    institution_id_str = payload.get("institution_id")
-    if not institution_id_str:
-        raise HTTPException(status_code=403, detail={"error": "no_institution", "message": "No institution linked"})
-
-    institution_id = UUID(institution_id_str)
-
-    from ..db.models import Exam, ExamSet, User
     from sqlalchemy import func, or_
+    from ..db.models import Exam, ExamSet
 
-    student_id_str = payload.get("user_id") or payload.get("sub")
-    student = None
-    if student_id_str:
+    sub_claim = payload.get("sub", "")
+    user = None
+    if sub_claim:
         try:
-            student = db.query(User).filter(User.id == UUID(student_id_str)).first()
+            sub_uuid = UUID(sub_claim)
+            user = db.query(User).filter(or_(User.id == sub_uuid, User.kcet_student_id == sub_claim, User.email == sub_claim)).first()
         except Exception:
-            student = None
+            user = db.query(User).filter(or_(User.kcet_student_id == sub_claim, User.email == sub_claim)).first()
 
-    student_batch_id = getattr(student, "batch_id", None) if student else None
+    institution_id = None
+    if user and user.institution_id:
+        institution_id = user.institution_id
+    elif payload.get("institution_id"):
+        try:
+            institution_id = UUID(payload.get("institution_id"))
+        except Exception:
+            institution_id = None
 
-    # Filter: ONLY exams belonging to this institution, AND either assigned to student's batch OR all batches
+    if not institution_id:
+        return make_response(jsonify({"error": "no_institution", "message": "No institution linked"}), 403)
+
+    student_batch_id = getattr(user, "batch_id", None) if user else None
+
+    # Filter: ONLY exams belonging to this institution
     filters = [
         Exam.is_published.is_(True),
         Exam.institution_id == institution_id,
     ]
     if student_batch_id:
         filters.append(or_(Exam.batch_id.is_(None), Exam.batch_id == student_batch_id))
-    else:
-        filters.append(Exam.batch_id.is_(None))
 
     stmt = (
         db.query(Exam, func.count(ExamSet.id).label("set_count"))
@@ -1123,14 +1161,21 @@ def get_institution_student_exams():
         .all()
     )
 
-    buckets: dict[str, list] = {}
-    for exam, set_count in stmt:
-        sets_list = (
+    exam_ids = [exam.id for exam, _ in stmt]
+    all_exam_sets: dict[UUID, list[ExamSet]] = {}
+    if exam_ids:
+        sets_rows = (
             db.query(ExamSet)
-            .filter(ExamSet.exam_id == exam.id)
+            .filter(ExamSet.exam_id.in_(exam_ids))
             .order_by(ExamSet.set_label.asc())
             .all()
         )
+        for es in sets_rows:
+            all_exam_sets.setdefault(es.exam_id, []).append(es)
+
+    buckets: dict[str, list] = {}
+    for exam, set_count in stmt:
+        sets_list = all_exam_sets.get(exam.id, [])
         bucket = buckets.setdefault(exam.subject, [])
         bucket.append({
             "exam_id": str(exam.id),

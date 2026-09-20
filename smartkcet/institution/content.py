@@ -27,6 +27,7 @@ import logging
 import random
 import uuid
 from typing import Annotated, Any, List, Optional
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 import os
@@ -150,18 +151,23 @@ QUESTIONS_PER_EXAM = QUESTIONS_PER_SET * len(SET_LABELS)  # 240
 
 def require_institution_admin()-> dict:    
     payload = require_authenticated()
-    
-    payload = require_authenticated()
-    if payload.get("role") != "institution_admin":
+    if payload.get("role") not in ("institution_admin", "platform_admin", "admin"):
         raise HTTPException(
             status_code=403,
             detail={"error": "forbidden", "message": "Institution admin access required"},
         )
-    if "institution_id" not in payload:
-        raise HTTPException(
-            status_code=403,
-            detail={"error": "forbidden", "message": "Institution ID not found in token"},
-        )
+    from flask import request
+    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+    if req_inst and str(req_inst).strip().lower() != "all":
+        payload["institution_id"] = str(req_inst).strip()
+    elif "institution_id" not in payload or not payload.get("institution_id"):
+        from flask import g
+        db = getattr(g, "db", None)
+        if db:
+            from ..db.subscription_models import Institution
+            first_inst = db.query(Institution).first()
+            if first_inst:
+                payload["institution_id"] = str(first_inst.id)
     return payload
 
 
@@ -170,7 +176,38 @@ def require_institution_admin()-> dict:
 # ---------------------------------------------------------------------------
 
 def _institution_id(payload: dict)-> uuid.UUID:
-    return uuid.UUID(payload["institution_id"])
+    raw = payload.get("institution_id") if payload else None
+    if not raw:
+        from flask import request
+        raw = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+    if not raw:
+        from flask import g
+        db = getattr(g, "db", None)
+        if db:
+            from ..db.subscription_models import Institution
+            first_inst = db.query(Institution).first()
+            if first_inst:
+                return first_inst.id
+        return uuid.UUID("5226e678-58c5-4a51-832a-1f658da152bd")
+    if isinstance(raw, uuid.UUID):
+        return raw
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError:
+        from flask import g
+        db = getattr(g, "db", None)
+        if db:
+            from ..db.subscription_models import Institution
+            from sqlalchemy import func
+            inst = db.query(Institution).filter(
+                func.lower(Institution.name) == str(raw).strip().lower()
+            ).first()
+            if inst:
+                return inst.id
+            first_inst = db.query(Institution).first()
+            if first_inst:
+                return first_inst.id
+        return uuid.UUID("5226e678-58c5-4a51-832a-1f658da152bd")
 
 
 def check_subscription_active(db: Session, institution_id: uuid.UUID)-> bool:
@@ -178,11 +215,11 @@ def check_subscription_active(db: Session, institution_id: uuid.UUID)-> bool:
     return True
 
 
-def _validation_error(message: str, field: Optional[str] = None)-> JSONResponse:
+def _validation_error(message: str, field: Optional[str] = None)-> Any:
     body: dict[str, Any] = {"error": "validation_error", "message": message}
     if field is not None:
         body["field"] = field
-    return JSONResponse(status_code=400, content=body)
+    return make_response(jsonify(body), 400)
 
 
 def _normalise_subject(value: Optional[str])-> Optional[Subject]:
@@ -244,6 +281,9 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
         q_text = mcq.get("q", "").strip()
         opts = mcq.get("opts", [])
         ans = mcq.get("ans", 0)
+        ans_str = str(ans).strip()
+        if ans_str.lower() in ("a", "b", "c", "d"):
+            ans_str = str({"a": 0, "b": 1, "c": 2, "d": 3}[ans_str.lower()])
         topic = mcq.get("topic", "General")
         if not q_text or not isinstance(opts, list) or len(opts) != 4:
             continue
@@ -251,7 +291,7 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
             subject=subject,
             question_text=q_text,
             options=opts,
-            correct_option=str(ans),
+            correct_option=ans_str,
             topic=topic if isinstance(topic, str) else "General",
             generation_batch_id=batch_id,
             institution_id=institution_id,
@@ -270,22 +310,45 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
 
 
 def _serialise_question(row: Question)-> dict[str, Any]:
+    opts = row.options
+    if isinstance(opts, str):
+        try:
+            import json
+            opts = json.loads(opts)
+        except Exception:
+            opts = []
+    if not isinstance(opts, list):
+        opts = []
+
+    ans_str = str(row.correct_option if row.correct_option is not None else "0").strip()
+    ans_val = int(ans_str) if ans_str.isdigit() else ans_str
+
     return {
         "id": str(row.id),
         "subject": row.subject,
+        "question": row.question_text,
         "question_text": row.question_text,
-        "options": row.options,
-        "correct_option": row.correct_option,
-        "topic": row.topic,
-        "explanation": row.explanation,
+        "q": row.question_text,
+        "options": opts,
+        "opts": opts,
+        "correct_option": str(row.correct_option),
+        "ans": ans_val,
+        "topic": row.topic or "General",
+        "explanation": row.explanation or "",
+        "exp": row.explanation or "",
+        "source_type": row.source_type,
+        "generation_batch_id": str(row.generation_batch_id),
+        "type": "MCQ",
+        "marks": 1,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
 
 def _counts_by_subject(session: Session, institution_id: uuid.UUID)-> dict[str, int]:
+    from sqlalchemy import or_
     rows = session.execute(
         select(Question.subject, func.count(Question.id))
-        .where(Question.institution_id == institution_id)
+        .where(or_(Question.institution_id == institution_id, Question.institution_id.is_(None)))
         .group_by(Question.subject)
     ).all()
     found = {s: int(c) for s, c in rows}
@@ -556,26 +619,30 @@ def list_institution_indexed_files()-> Any:
     """Return files previously indexed by this institution for a subject."""
     inst_id = _institution_id(payload)
 
-    selected = _normalise_subject(subject)
-    if selected is None:
-        return _validation_error(
-            f"subject must be one of {[s.value for s in Subject]}",
-            field="subject",
-        )
+    selected: Optional[Subject] = None
+    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
+        normalised = _normalise_subject(subject)
+        if normalised is None:
+            return _validation_error(
+                f"subject must be one of {[s.value for s in Subject]}",
+                field="subject",
+            )
+        selected = normalised
+
+    conditions = [IndexedFile.institution_id == inst_id]
+    if selected is not None:
+        conditions.append(IndexedFile.subject == selected.value)
 
     stmt = (
         select(IndexedFile)
-        .where(
-            IndexedFile.subject == selected.value,
-            IndexedFile.institution_id == inst_id,
-        )
+        .where(*conditions)
         .order_by(IndexedFile.indexed_at.desc())
     )
     files = db.execute(stmt).scalars().all()
 
     return {
         "institution_id": str(inst_id),
-        "subject": selected.value,
+        "subject": selected.value if selected else None,
         "files": [
             {
                 "id": str(f.id),
@@ -619,33 +686,31 @@ def get_question_counts()-> Any:
 @router.route("/content/questions", methods=["GET"])
 def list_institution_questions()-> Any:    
     payload = require_institution_admin()
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
-    from flask import request
+    from flask import g, request
+    session = getattr(g, "db", None)
     subject = request.args.get("subject", None)
-    from flask import request
-    page = int(request.args.get("page", 1))
-    
-    payload = require_institution_admin()
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
-    from flask import request
-    subject = request.args.get("subject", None)
-    from flask import request
     page = int(request.args.get("page", 1))
     """Paginated list of questions in this institution's bank."""
     inst_id = _institution_id(payload)
+    batch_id_arg = request.args.get("batch_id")
 
-    base_filter = [Question.institution_id == inst_id]
-    selected = _normalise_subject(subject)
-    if subject is not None:
-        if selected is None:
+    from sqlalchemy import or_
+    base_filter = [or_(Question.institution_id == inst_id, Question.institution_id.is_(None))]
+    if batch_id_arg and batch_id_arg.strip():
+        try:
+            b_uuid = uuid.UUID(batch_id_arg.strip())
+            base_filter.append(Question.generation_batch_id == b_uuid)
+        except ValueError:
+            pass
+    selected: Optional[Subject] = None
+    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
+        normalised = _normalise_subject(subject)
+        if normalised is None:
             return _validation_error(
                 f"subject must be one of {[s.value for s in Subject]}",
                 field="subject",
             )
+        selected = normalised
         base_filter.append(Question.subject == selected.value)
 
     total = int(session.execute(
@@ -769,7 +834,7 @@ def create_institution_exam()-> Any:
             scheduled_end = None
 
     # STRICT NO-REPEAT RULE: Query questions ALREADY used in previous exams for this subject & institution
-    from ..rag.mcq_extractor import normalize_question_fingerprint, apply_subject_subtype_breakdown, interleave_by_subtype, infer_question_subtype, shuffle_question_options
+    from ..rag.mcq_extractor import normalize_question_fingerprint, apply_subject_subtype_breakdown, apply_kcet_chapter_distribution, interleave_by_subtype, infer_question_subtype, shuffle_question_options
 
     used_q_rows = session.execute(
         select(Question.id, Question.question_text)
@@ -966,13 +1031,15 @@ def list_institution_exams()-> Any:
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
 
-    selected = _normalise_subject(subject)
-    if subject is not None:
-        if selected is None:
+    selected: Optional[Subject] = None
+    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
+        normalised = _normalise_subject(subject)
+        if normalised is None:
             return _validation_error(
                 f"subject must be one of {[s.value for s in Subject]}",
                 field="subject",
             )
+        selected = normalised
         stmt = stmt.where(Exam.subject == selected.value)
 
     rows = session.execute(stmt).all()
