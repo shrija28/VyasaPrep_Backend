@@ -19,10 +19,8 @@ import logging
 from typing import Any, Optional
 
 import os
-from flask import Blueprint, request, g, make_response, jsonify, Response
-from fastapi.responses import JSONResponse, FileResponse
+from flask import Blueprint, request, g, make_response, jsonify, Response, send_file
 from pydantic import BaseModel
-import os
 import uuid
 import shutil
 from pathlib import Path as PathlibPath
@@ -37,7 +35,7 @@ from ..middleware.rbac import require_admin
 logger = logging.getLogger("smartkcet.admin.syllabus")
 
 router = Blueprint("admin_syllabus", __name__)
-router = Blueprint("admin_syllabus", __name__)
+
 
 
 # ---------------------------------------------------------------------------
@@ -64,22 +62,20 @@ def _serialise(t: SyllabusTopic)-> dict[str, Any]:
 TEXTBOOKS_DIR = PathlibPath(__file__).resolve().parent.parent.parent / "data" / "textbooks"
 
 @router.route("/syllabus/textbook/<filename>")
-def download_textbook(filename: str)-> FileResponse:
+def download_textbook(filename: str):
     """Download/view an associated textbook file."""
     file_path = TEXTBOOKS_DIR / filename
+
     if not file_path.exists() or not file_path.is_file():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="Textbook file not found")
-    return FileResponse(file_path, filename=filename)
+        return jsonify({"detail": "Textbook file not found"}), 404
 
+    return send_file(file_path, as_attachment=True, download_name=filename)
 
-def _validation_error(msg: str, field: Optional[str] = None)-> JSONResponse:
+def _validation_error(msg: str, field: Optional[str] = None):
     body: dict[str, Any] = {"error": "validation_error", "message": msg}
     if field:
         body["field"] = field
-    return JSONResponse(status_code=400, content=body)
-
-
+    return jsonify(body), 400
 VALID_PUC = {"1st PUC", "2nd PUC"}
 VALID_SUBJECTS = {s.value for s in Subject}
 

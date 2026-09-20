@@ -38,7 +38,6 @@ Endpoints
 """
 
 from __future__ import annotations
-import os
 
 import logging
 import random
@@ -46,16 +45,20 @@ import time
 import uuid
 from typing import Any, Optional
 
-import os
-from flask import Blueprint, request, g, make_response, jsonify, Response
-from fastapi.responses import JSONResponse
+from flask import Blueprint, request, g, make_response, jsonify
 from pydantic import BaseModel
 from sqlalchemy import func, select, delete
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ..db.models import Exam, ExamSet, ExamSetQuestion, Question, Subject, Submission
-from ..db.session import get_async_session as get_session
+from ..db.models import (
+    Exam,
+    ExamSet,
+    ExamSetQuestion,
+    Question,
+    Subject,
+    Submission,
+)
 from ..middleware.rbac import require_admin
 
 logger = logging.getLogger("smartkcet.admin.exams")
@@ -124,13 +127,12 @@ class PublishExamRequest(BaseModel):
 # POST /api/admin/exams  (REQ-7.1, REQ-7.2, REQ-7.3 / design.md §4)
 # ---------------------------------------------------------------------------
 
-
 @router.route("/exams", methods=["POST"])
-def create_exam()-> Any:    
-    from flask import request
+def create_exam() -> Any:
     payload = CreateExamRequest(**(request.get_json() or {}))
+
     _admin = require_admin()
-    from flask import g
+
     db = getattr(g, "db", None)
     session = db
     """Create one exam (1 row + 4 sets + 80 set-question links) atomically.
@@ -627,11 +629,9 @@ def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, se
 
 
 @router.route("/exams/<exam_id>", methods=["PATCH"])
-def patch_exam(exam_id: str) -> Any:    
-    from flask import request
+def patch_exam(exam_id: str) -> Any:
     payload = PublishExamRequest(**(request.get_json() or {}))
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Toggle publish/unpublish on an existing exam (idempotent)."""
@@ -668,12 +668,9 @@ def patch_exam(exam_id: str) -> Any:
 
     return make_response(jsonify({"exam_id": str(exam.id), "is_published": exam.is_published}), 200)
 
-
-@router.route("/exams/<exam_id>", methods=["DELETE"])
 def delete_exam(exam_id: str) -> Any:
     """Permanently delete an exam and its sets / submissions."""
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
 
@@ -719,13 +716,11 @@ def delete_exam(exam_id: str) -> Any:
 
 
 @router.route("/exams", methods=["GET"])
-def list_exams()-> Any:    
+def list_exams() -> Any:
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
-    from flask import request
-    subject = request.args.get("subject", None)
+    subject = request.args.get("subject")
     """List all exams with subject, creation date, published status, set_count.
 
     REQ-7.6: the admin panel shows every exam regardless of publish
@@ -788,7 +783,6 @@ def list_exams()-> Any:
 def get_exam_details(exam_id: str) -> Any:
     """Return the exam with all sets (A/B/C/D) and their assigned questions."""
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
 

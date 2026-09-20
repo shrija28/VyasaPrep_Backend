@@ -47,7 +47,6 @@ from typing import Any, Optional
 
 import os
 from flask import Blueprint, request, g, make_response, jsonify, Response
-from fastapi.responses import JSONResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -75,15 +74,13 @@ INSUFFICIENT_THRESHOLD = 20
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _validation_error(message: str, field: Optional[str] = None)-> JSONResponse:
+def _validation_error(message: str, field: Optional[str] = None):
     """Return a 400 envelope identical in shape to other admin endpoints."""
 
     body: dict[str, Any] = {"error": "validation_error", "message": message}
     if field is not None:
         body["field"] = field
-    return JSONResponse(status_code=400, content=body)
+    return jsonify(body), 400
 
 
 def _normalise_subject(value: Optional[str])-> Optional[Subject]:
@@ -144,9 +141,8 @@ def _counts_by_subject(session: Session)-> dict[str, int]:
 
 
 @router.route("/questions/counts", methods=["GET"])
-def list_counts()-> Any:    
+def list_counts() -> Any:
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Return per-subject totals + ``insufficient`` flags + the threshold.
@@ -174,13 +170,12 @@ def list_counts()-> Any:
 
 
 @router.route("/questions", methods=["GET"])
-def list_questions()-> Any:    
+def list_questions() -> Any:
     _admin = require_admin()
-    from flask import g, request
     db = getattr(g, "db", None)
     session = db
-    subject = request.args.get("subject", None)
-    source = request.args.get("source", None)
+    subject = request.args.get("subject")
+    source = request.args.get("source")
     try:
         page = int(request.args.get("page", 1))
         if page < 1:
@@ -261,9 +256,8 @@ def list_questions()-> Any:
 
 
 @router.route("/questions/<question_id>", methods=["DELETE"])
-def delete_question(question_id: uuid.UUID)-> Any:    
+def delete_question(question_id: uuid.UUID) -> Any:
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Delete a single question, reporting DB-level success or failure.
@@ -315,7 +309,6 @@ def delete_question(question_id: uuid.UUID)-> Any:
 def clear_questions() -> Any:
     """Clear all questions or clear questions for a specific subject."""
     _admin = require_admin()
-    from flask import g, request
     db = getattr(g, "db", None)
     session = db
     

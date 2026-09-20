@@ -15,13 +15,13 @@ All filters are optional and combinable:
 
 * ``subject`` — one of Biology / Physics / Chemistry / Mathematics.
 * ``student`` — a KCET Student ID (e.g. ``KCET0001``).
-* ``set``     — an ``exam_set_id`` (UUID).
-* ``status``  — ``completed`` or ``in_progress``.
+* ``set`` — an ``exam_set_id`` (UUID).
+* ``status`` — ``completed`` or ``in_progress``.
 
 Pagination
 ----------
 
-* ``limit``  — default 100, max 500.
+* ``limit`` — default 100, max 500.
 * ``offset`` — default 0.
 
 Empty-state
@@ -34,20 +34,15 @@ frontend can render the empty-state message instead of empty charts
 """
 
 from __future__ import annotations
-import os
 
 import uuid
 from typing import Any, Optional
 
-import os
-from flask import Blueprint, request, g, make_response, jsonify, Response
-from fastapi.responses import JSONResponse
+from flask import Blueprint, request, g, jsonify
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
 
 from ..db.models import Exam, ExamSet, Submission, Subject, User
-from ..db.session import get_async_session as get_session
-from ..middleware.rbac import require_admin, require_authenticated
+from ..middleware.rbac import require_admin
 
 router = Blueprint("admin_analytics", __name__)
 
@@ -60,23 +55,36 @@ _MAX_LIMIT = 500
 # ---------------------------------------------------------------------------
 
 
-def _validation_error(message: str, field: Optional[str] = None)-> JSONResponse:
+def _validation_error(
+    message: str,
+    field: Optional[str] = None,
+):
     """Return a 400 envelope identical in shape to other admin endpoints."""
 
-    body: dict[str, Any] = {"error": "validation_error", "message": message}
+    body: dict[str, Any] = {
+        "error": "validation_error",
+        "message": message,
+    }
+
     if field is not None:
         body["field"] = field
-    return JSONResponse(status_code=400, content=body)
+
+    return jsonify(body), 400
 
 
-def _normalise_subject(value: Optional[str])-> Optional[Subject]:
+def _normalise_subject(
+    value: Optional[str],
+) -> Optional[Subject]:
     """Return the matching :class:`Subject` enum or ``None`` for invalid input."""
 
     if not isinstance(value, str):
         return None
+
     stripped = value.strip()
+
     if not stripped:
         return None
+
     try:
         return Subject(stripped)
     except ValueError:
@@ -84,45 +92,12 @@ def _normalise_subject(value: Optional[str])-> Optional[Subject]:
 
 
 # ---------------------------------------------------------------------------
-# GET /api/admin/analytics  (REQ-12.1, REQ-12.2, REQ-12.3, REQ-12.6)
+# GET /api/admin/analytics
 # ---------------------------------------------------------------------------
 
 
 @router.route("/analytics", methods=["GET"])
-def get_analytics()-> Any:    
-    payload = require_authenticated()
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
-    from flask import request
-    subject = request.args.get("subject", None)
-    from flask import request
-    student = request.args.get("student", None)
-    from flask import request
-    set = request.args.get("set", None)
-    from flask import request
-    status_filter = request.args.get("status", None)
-    from flask import request
-    limit = int(request.args.get("limit", _DEFAULT_LIMIT))
-    from flask import request
-    offset = int(request.args.get("offset", 0))
-    
-    payload = require_authenticated()
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
-    from flask import request
-    subject = request.args.get("subject", None)
-    from flask import request
-    student = request.args.get("student", None)
-    from flask import request
-    set = request.args.get("set", None)
-    from flask import request
-    status_filter = request.args.get("status", None)
-    from flask import request
-    limit = int(request.args.get("limit", _DEFAULT_LIMIT))
-    from flask import request
-    offset = int(request.args.get("offset", 0))
+def get_analytics() -> Any:
     """Return aggregate analytics across all students with optional filters.
 
     The response shape matches the ``submissions`` array that
@@ -130,137 +105,376 @@ def get_analytics()-> Any:
     and ``kcet_student_id`` fields for the admin results table.
 
     Default sort: ``submitted_at DESC`` (REQ-12.3).
-    
-    **Institution Integration (REQ-7.4, 9.7):**
-    - Platform admins see all submissions across all students
-    - Institution admins see only submissions from students linked to their institution
-    """
-    
-    # Require admin role (platform_admin or institution_admin)
-    admin_role = _admin.get("role")
-    if admin_role not in ("platform_admin", "institution_admin"):
-        return make_response(jsonify({
-                "error": "forbidden",
-                "message": "Admin access required",
-            }), 403)
 
-    # --- Validate filters ---------------------------------------------------
+    Institution Integration (REQ-7.4, 9.7):
+    - Platform admins see all submissions across all students.
+    - Institution admins see only submissions from students linked to
+      their institution.
+    """
+
+    # -----------------------------------------------------------------------
+    # Require admin role
+    # -----------------------------------------------------------------------
+
+    _admin = require_admin()
+
+    admin_role = _admin.get("role")
+
+    if admin_role not in (
+        "platform_admin",
+        "institution_admin",
+    ):
+        return jsonify({
+            "error": "forbidden",
+            "message": "Admin access required",
+        }), 403
+
+    # -----------------------------------------------------------------------
+    # Get database session
+    # -----------------------------------------------------------------------
+
+    session = getattr(g, "db", None)
+
+    if session is None:
+        return jsonify({
+            "error": "database_error",
+            "message": "Database session unavailable",
+        }), 500
+
+    # -----------------------------------------------------------------------
+    # Read query parameters
+    # -----------------------------------------------------------------------
+
+    subject = request.args.get("subject")
+    student = request.args.get("student")
+    set_filter = request.args.get("set")
+    status_filter = request.args.get("status")
+
+    # -----------------------------------------------------------------------
+    # Pagination parameters
+    # -----------------------------------------------------------------------
+
+    try:
+        limit = int(
+            request.args.get(
+                "limit",
+                _DEFAULT_LIMIT,
+            )
+        )
+
+        offset = int(
+            request.args.get(
+                "offset",
+                0,
+            )
+        )
+
+    except (TypeError, ValueError):
+        return _validation_error(
+            "limit and offset must be integers"
+        )
+
+    if limit < 1:
+        return _validation_error(
+            "limit must be greater than 0",
+            field="limit",
+        )
+
+    if offset < 0:
+        return _validation_error(
+            "offset must be greater than or equal to 0",
+            field="offset",
+        )
+
+    # -----------------------------------------------------------------------
+    # Validate subject filter
+    # -----------------------------------------------------------------------
 
     selected_subject: Optional[Subject] = None
+
     if subject is not None:
+
         normalised = _normalise_subject(subject)
+
         if normalised is None:
-            allowed = [s.value for s in Subject]
+
+            allowed = [
+                s.value
+                for s in Subject
+            ]
+
             return _validation_error(
                 f"subject must be one of {allowed}",
                 field="subject",
             )
+
         selected_subject = normalised
 
+    # -----------------------------------------------------------------------
     # Validate status filter
-    valid_statuses = ("completed", "in_progress")
-    if status_filter is not None and status_filter not in valid_statuses:
+    # -----------------------------------------------------------------------
+
+    valid_statuses = (
+        "completed",
+        "in_progress",
+    )
+
+    if (
+        status_filter is not None
+        and status_filter not in valid_statuses
+    ):
         return _validation_error(
             f"status must be one of {list(valid_statuses)}",
             field="status",
         )
 
-    # Validate set filter (must be a valid UUID)
+    # -----------------------------------------------------------------------
+    # Validate exam-set UUID
+    # -----------------------------------------------------------------------
+
     set_uuid: Optional[uuid.UUID] = None
-    if set is not None:
+
+    if set_filter is not None:
+
         try:
-            set_uuid = uuid.UUID(set)
-        except (ValueError, AttributeError):
+            set_uuid = uuid.UUID(set_filter)
+
+        except (
+            ValueError,
+            AttributeError,
+        ):
             return _validation_error(
                 "set must be a valid UUID (exam_set_id)",
                 field="set",
             )
 
-    # --- Build query ---------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Build pagination
+    # -----------------------------------------------------------------------
 
-    capped_limit = min(int(limit), _MAX_LIMIT)
+    capped_limit = min(
+        limit,
+        _MAX_LIMIT,
+    )
 
-    # Build the active filters dict for the response envelope.
+    # -----------------------------------------------------------------------
+    # Build active filters response
+    # -----------------------------------------------------------------------
+
     filters_response: dict[str, Any] = {
-        "subject": selected_subject.value if selected_subject is not None else None,
-        "student": student if student else None,
-        "set": set if set else None,
-        "status": status_filter if status_filter else None,
+        "subject": (
+            selected_subject.value
+            if selected_subject is not None
+            else None
+        ),
+        "student": (
+            student
+            if student
+            else None
+        ),
+        "set": (
+            set_filter
+            if set_filter
+            else None
+        ),
+        "status": (
+            status_filter
+            if status_filter
+            else None
+        ),
     }
 
-    # Core query: submissions joined with exam_sets, exams, and users.
+    # -----------------------------------------------------------------------
+    # Core query
+    #
+    # Submissions joined with:
+    #   - exam_sets
+    #   - exams
+    #   - users
+    # -----------------------------------------------------------------------
+
     stmt = (
-        select(Submission, ExamSet, Exam, User)
-        .join(ExamSet, ExamSet.id == Submission.exam_set_id)
-        .join(Exam, Exam.id == ExamSet.exam_id)
-        .join(User, User.id == Submission.user_id)
+        select(
+            Submission,
+            ExamSet,
+            Exam,
+            User,
+        )
+        .join(
+            ExamSet,
+            ExamSet.id == Submission.exam_set_id,
+        )
+        .join(
+            Exam,
+            Exam.id == ExamSet.exam_id,
+        )
+        .join(
+            User,
+            User.id == Submission.user_id,
+        )
     )
 
-    # Institution scoping (REQ-7.4, 7.7, 9.7):
-    # - Platform admins see all submissions
-    # - Institution admins see only submissions from their institution's students
-    admin_role = _admin.get("role")
-    admin_institution_id = _admin.get("institution_id")
-    
-    if admin_role == "institution_admin" and admin_institution_id is not None:
-        # Scope to institution's students only (REQ-7.7)
-        stmt = stmt.where(User.institution_id == admin_institution_id)
+    # -----------------------------------------------------------------------
+    # Institution scoping
+    #
+    # Platform admins:
+    #   See all submissions.
+    #
+    # Institution admins:
+    #   See only submissions belonging to their institution.
+    # -----------------------------------------------------------------------
 
+    admin_institution_id = _admin.get(
+        "institution_id"
+    )
+
+    if (
+        admin_role == "institution_admin"
+        and admin_institution_id is not None
+    ):
+        stmt = stmt.where(
+            User.institution_id
+            == admin_institution_id
+        )
+
+    # -----------------------------------------------------------------------
     # Apply filters
+    # -----------------------------------------------------------------------
+
     if selected_subject is not None:
-        stmt = stmt.where(Exam.subject == selected_subject.value)
+        stmt = stmt.where(
+            Exam.subject
+            == selected_subject.value
+        )
 
     if student:
-        # Filter by KCET Student ID
-        stmt = stmt.where(User.kcet_student_id == student.strip())
+        stmt = stmt.where(
+            User.kcet_student_id
+            == student.strip()
+        )
 
     if set_uuid is not None:
-        stmt = stmt.where(Submission.exam_set_id == set_uuid)
+        stmt = stmt.where(
+            Submission.exam_set_id
+            == set_uuid
+        )
 
     if status_filter is not None:
-        stmt = stmt.where(Submission.status == status_filter)
+        stmt = stmt.where(
+            Submission.status
+            == status_filter
+        )
 
-    # Default sort: submitted_at DESC (REQ-12.3), tie-break on id
+    # -----------------------------------------------------------------------
+    # Default sorting
+    # -----------------------------------------------------------------------
+
     stmt = stmt.order_by(
-        Submission.submitted_at.desc(), Submission.id.asc()
+        Submission.submitted_at.desc(),
+        Submission.id.asc(),
     )
 
+    # -----------------------------------------------------------------------
     # Get total count before pagination
-    count_stmt = select(func.count()).select_from(stmt.subquery())
-    total = int(session.execute(count_stmt).scalar_one())
+    # -----------------------------------------------------------------------
 
+    count_stmt = (
+        select(func.count())
+        .select_from(
+            stmt.subquery()
+        )
+    )
+
+    total = int(
+        session.execute(
+            count_stmt
+        ).scalar_one()
+    )
+
+    # -----------------------------------------------------------------------
     # Apply pagination
-    stmt = stmt.offset(offset).limit(capped_limit)
+    # -----------------------------------------------------------------------
+
+    stmt = (
+        stmt
+        .offset(offset)
+        .limit(capped_limit)
+    )
 
     rows = session.execute(stmt).all()
 
-    # --- Build response ------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Build response
+    # -----------------------------------------------------------------------
 
     submissions: list[dict[str, Any]] = []
-    for submission, exam_set, exam, user in rows:
+
+    for (
+        submission,
+        exam_set,
+        exam,
+        user,
+    ) in rows:
+
         submitted_at = submission.submitted_at
+
         submissions.append(
             {
-                "id": str(submission.id),
-                "student_name": user.display_name,
-                "kcet_student_id": user.kcet_student_id or "",
-                "exam_set_id": str(submission.exam_set_id),
-                "set_label": exam_set.set_label,
-                "subject": exam.subject,
-                "score_pct": float(submission.score_pct),
-                "time_taken_sec": int(submission.time_taken_sec),
+                "id": str(
+                    submission.id
+                ),
+
+                "student_name": (
+                    user.display_name
+                ),
+
+                "kcet_student_id": (
+                    user.kcet_student_id
+                    or ""
+                ),
+
+                "exam_set_id": str(
+                    submission.exam_set_id
+                ),
+
+                "set_label": (
+                    exam_set.set_label
+                ),
+
+                "subject": (
+                    exam.subject
+                ),
+
+                "score_pct": float(
+                    submission.score_pct
+                ),
+
+                "time_taken_sec": int(
+                    submission.time_taken_sec
+                ),
+
                 "submitted_at": (
                     submitted_at.isoformat()
                     if submitted_at is not None
                     else None
                 ),
-                "status": submission.status,
-                "pass_flag": float(submission.score_pct) >= 50.0,
+
+                "status": (
+                    submission.status
+                ),
+
+                "pass_flag": (
+                    float(
+                        submission.score_pct
+                    ) >= 50.0
+                ),
             }
         )
 
-    # REQ-12.6: empty filtered subset → empty: true so the frontend
-    # renders the empty-state message instead of empty charts.
+    # -----------------------------------------------------------------------
+    # Empty-state
+    # -----------------------------------------------------------------------
+
     is_empty = total == 0
 
     return {
@@ -269,7 +483,7 @@ def get_analytics()-> Any:
         "empty": is_empty,
         "filters": filters_response,
         "limit": capped_limit,
-        "offset": int(offset),
+        "offset": offset,
     }
 
 

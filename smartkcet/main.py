@@ -10,8 +10,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 import nest_asyncio
 from flask import Flask, jsonify, request, send_from_directory, redirect, Blueprint
 from flask_cors import CORS
-from fastapi.exceptions import HTTPException as FastAPIHTTPException
-
+from werkzeug.exceptions import HTTPException
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 nest_asyncio.apply()
@@ -150,15 +149,14 @@ def create_app():
             return redirect(f"/not-found?path={quote(path)}", code=302)
         
         return jsonify({"detail": "Not Found"}), 404
-
-    @app.errorhandler(FastAPIHTTPException)
-    def fastapi_http_exception_handler(error):
-        detail = error.detail
-        if isinstance(detail, dict):
-            response = {"detail": detail}
-        else:
-            response = {"detail": {"message": str(detail)}}
-        return jsonify(response), error.status_code
+    @app.errorhandler(HTTPException)
+    def http_exception_handler(error):
+     response = {
+        "detail": {
+            "message": error.description
+        }
+    }
+     return jsonify(response), error.code
 
     @app.route("/css/<path:filepath>")
     def serve_css(filepath):

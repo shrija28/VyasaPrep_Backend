@@ -34,9 +34,7 @@ import uuid
 import logging
 from typing import Any, Optional
 
-import os
-from flask import Blueprint, request, g, make_response, jsonify, Response
-from fastapi.responses import JSONResponse
+from flask import Blueprint, request, g, make_response, jsonify, Response, send_file
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.orm import Session
 
@@ -137,9 +135,8 @@ def _question_row_to_dict(row: Question, set_label: str, index: int)-> dict:
 
 
 @router.route("/generate", methods=["POST"])
-def generate()-> Any:    
+def generate() -> Any:
     _admin = require_admin()
-    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Generate 4 paper sets (60 questions per set = 240 total unique questions)
