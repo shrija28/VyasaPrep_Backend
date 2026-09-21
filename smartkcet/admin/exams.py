@@ -314,8 +314,15 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
     )
     drawn: list[uuid.UUID] = [q.id for q in sampled_rows]
 
-    partitions: list[list[uuid.UUID]] = [drawn]
-    labels = ["A"]
+    labels = list(SET_LABELS)
+    partitions: list[list[uuid.UUID]] = []
+    for s_i in range(len(labels)):
+        set_qids = list(drawn)
+        if s_i > 0:
+            random.shuffle(set_qids)
+            if set_qids == drawn and len(set_qids) > 1:
+                set_qids.reverse()
+        partitions.append(set_qids)
 
     exam_inst_id = None
     if payload.institution_id:
@@ -601,11 +608,15 @@ def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, se
     session.add(exam)
     try:
         session.flush()
-        drawn = stored_ids[:QUESTIONS_PER_EXAM]
-        partitions = [
-            drawn[i * QUESTIONS_PER_SET : (i + 1) * QUESTIONS_PER_SET]
-            for i in range(len(SET_LABELS))
-        ]
+        base_60 = stored_ids[:QUESTIONS_PER_SET]
+        partitions: list[list[uuid.UUID]] = []
+        for s_i in range(len(SET_LABELS)):
+            set_qids = list(base_60)
+            if s_i > 0:
+                random.shuffle(set_qids)
+                if set_qids == base_60 and len(set_qids) > 1:
+                    set_qids.reverse()
+            partitions.append(set_qids)
         sets_payload: list[dict[str, Any]] = []
         for label, qids in zip(SET_LABELS, partitions):
             exam_set = ExamSet(exam_id=exam.id, set_label=label)

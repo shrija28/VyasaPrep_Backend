@@ -386,15 +386,36 @@ def get_dashboard_stats() -> Any:
 
     # Starter state when student has 0 submissions
     if not rows:
+        inst_name = None
+        student_id_val = user.kcet_student_id or str(user.id)
+        if user.institution_id:
+            from ..db.subscription_models import Institution
+            inst_row = session.query(Institution).filter(Institution.id == user.institution_id).first()
+            inst_name = inst_row.name if inst_row else "Institution"
+
+        cohort_rank_str = f"— in {inst_name}" if inst_name else "—"
+
         return jsonify({
+            "student": {
+                "student_id": student_id_val,
+                "kcet_student_id": student_id_val,
+                "display_name": user.display_name or user.email,
+                "email": user.email,
+                "institution_id": str(user.institution_id) if user.institution_id else None,
+                "institution_name": inst_name,
+                "student_subtype": user.student_subtype,
+                "cohort_rank": cohort_rank_str,
+            },
             "kpis": {
+                "studentId": student_id_val,
                 "examsTaken": 0,
                 "submissions": 0,
                 "avgScore": 0,
                 "passRate": 0,
                 "avgTime": 0,
                 "rank": "—",
-                "rankHint": "Complete at least one mock exam to generate your score and rank analytics",
+                "cohortRank": cohort_rank_str,
+                "rankHint": f"Take your first exam to generate your score and cohort rank in {inst_name}" if inst_name else "Complete at least one mock exam to generate your score and rank analytics",
             },
             "topicData": {
                 "labels": ["Physics", "Chemistry", "Mathematics", "Biology"],
@@ -464,17 +485,53 @@ def get_dashboard_stats() -> Any:
     total_time = sum(int(sub.time_taken_sec or 0) for sub, _, _ in rows)
     avg_time = round(total_time / (submissions_count * 60)) if submissions_count > 0 else 0
 
-    # Determine user's rank
+    # Determine user's rank (Cohort rank for institution-linked students, Statewide rank for direct subscribers)
     my_rank: Any = "—"
-    rank_hint = "Score at least 30% on average to qualify on statewide leaderboard"
-    for entry in ranked:
-        if entry.student_id == str(user.id) or entry.kcet_student_id == user.kcet_student_id:
-            my_rank = entry.rank
-            rank_hint = f"Ranked #{my_rank} out of {len(ranked)} on statewide leaderboard"
-            break
+    cohort_rank_str: str = "—"
+    institution_name = None
+    if user.institution_id:
+        from ..db.subscription_models import Institution
+        inst_row = session.query(Institution).filter(Institution.id == user.institution_id).first()
+        institution_name = inst_row.name if inst_row else "Institution"
 
-    if my_rank == "—" and avg_score >= 30.0:
-        rank_hint = "Take exams across more subjects to appear on statewide leaderboard"
+        inst_students = session.query(User.id).filter(
+            User.institution_id == user.institution_id,
+            User.role == "student"
+        ).all()
+        inst_student_ids = [r[0] for r in inst_students]
+
+        if inst_student_ids:
+            from sqlalchemy import func as sa_func
+            rank_rows = (
+                session.query(
+                    Submission.user_id,
+                    sa_func.avg(Submission.score_pct).label("avg_sc")
+                )
+                .filter(Submission.user_id.in_(inst_student_ids), Submission.status == "completed")
+                .group_by(Submission.user_id)
+                .order_by(sa_func.avg(Submission.score_pct).desc())
+                .all()
+            )
+            for idx, r in enumerate(rank_rows, start=1):
+                if r.user_id == user.id:
+                    my_rank = idx
+                    cohort_rank_str = f"#{idx} in {institution_name}"
+                    rank_hint = f"Ranked #{idx} out of {len(inst_student_ids)} in {institution_name}"
+                    break
+            if cohort_rank_str == "—":
+                cohort_rank_str = f"#1 in {institution_name}" if submissions_count > 0 else f"—"
+                rank_hint = f"Enrolled in {institution_name}"
+    else:
+        rank_hint = "Score at least 30% on average to qualify on statewide leaderboard"
+        for entry in ranked:
+            if entry.student_id == str(user.id) or entry.kcet_student_id == user.kcet_student_id:
+                my_rank = entry.rank
+                cohort_rank_str = f"#{entry.rank} Statewide"
+                rank_hint = f"Ranked #{my_rank} out of {len(ranked)} on statewide leaderboard"
+                break
+
+        if my_rank == "—" and avg_score >= 30.0:
+            rank_hint = "Take exams across more subjects to appear on statewide leaderboard"
 
     # 4. Subject / Topic scores
     subject_scores_dict: dict[str, list[float]] = {
@@ -645,14 +702,28 @@ def get_dashboard_stats() -> Any:
             "date": submitted_at_str,
         })
 
+    student_id_val = user.kcet_student_id or str(user.id)
+
     return jsonify({
+        "student": {
+            "student_id": student_id_val,
+            "kcet_student_id": student_id_val,
+            "display_name": user.display_name or user.email,
+            "email": user.email,
+            "institution_id": str(user.institution_id) if user.institution_id else None,
+            "institution_name": institution_name,
+            "student_subtype": user.student_subtype,
+            "cohort_rank": cohort_rank_str,
+        },
         "kpis": {
+            "studentId": student_id_val,
             "examsTaken": distinct_exam_ids,
             "submissions": submissions_count,
             "avgScore": avg_score,
             "passRate": pass_rate,
             "avgTime": avg_time,
             "rank": my_rank,
+            "cohortRank": cohort_rank_str,
             "rankHint": rank_hint,
         },
         "topicData": {

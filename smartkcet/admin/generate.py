@@ -313,28 +313,30 @@ def generate() -> Any:
     for top_name, top_qs in by_topic.items():
         random.shuffle(top_qs)
 
-    # Allocate questions into each of the 4 sets strictly following official chapter quotas
-    for s_idx in range(len(SET_LABELS)):
-        for top_name, target_q in blueprint_quotas.items():
-            t_list = by_topic.get(top_name, [])
-            for _ in range(target_q):
-                if t_list and len(sets_rows[s_idx]) < QUESTIONS_PER_SET:
-                    sets_rows[s_idx].append(t_list.pop(0))
+    # Allocate 1 base set of 60 questions strictly following official chapter quotas
+    base_set: list[Question] = []
+    for top_name, target_q in blueprint_quotas.items():
+        t_list = by_topic.get(top_name, [])
+        for _ in range(target_q):
+            if t_list and len(base_set) < QUESTIONS_PER_SET:
+                base_set.append(t_list.pop(0))
 
     # Fill any minor shortfalls from remaining questions
-    placed_ids = set(id(q) for s in sets_rows for q in s)
+    placed_ids = set(id(q) for q in base_set)
     remaining = [q for q in all_questions if id(q) not in placed_ids]
     random.shuffle(remaining)
-    for s in sets_rows:
-        while len(s) < QUESTIONS_PER_SET and remaining:
-            s.append(remaining.pop())
+    while len(base_set) < QUESTIONS_PER_SET and remaining:
+        base_set.append(remaining.pop())
 
     batch_id = uuid.uuid4()
     sets: list[list[dict]] = []
 
     for i, label in enumerate(SET_LABELS):
-        set_rows = sets_rows[i]
-        random.shuffle(set_rows)  # Shuffle so topics interleave naturally
+        set_rows = list(base_set)
+        if i > 0:
+            random.shuffle(set_rows)
+            if set_rows == base_set and len(set_rows) > 1:
+                set_rows.reverse()
         set_questions = [
             _question_row_to_dict(row, label, idx)
             for idx, row in enumerate(set_rows)

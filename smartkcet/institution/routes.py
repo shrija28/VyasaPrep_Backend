@@ -439,56 +439,131 @@ def remove_student(student_id: UUID):
 
 
 @router.route("/analytics", methods=["GET"])
+@router.route("/analytics/students", methods=["GET"])
 def get_institution_analytics():    
     payload = require_institution_admin()
     from flask import g
     db = getattr(g, "db", None)
-    session = db
-    """Get analytics for the institution's students.
-    
-    **Requirements:** 7.4, 9.6
-    
-    Returns aggregated analytics for all students linked to the institution,
-    including exam scores, completion rates, and per-student performance.
-    
-    Args:
-        payload: JWT payload from authentication middleware
-        db: Database session
-        
-    Returns:
-        Analytics data for the institution
-        
-    Raises:
-        HTTPException:
-            - 403: Not an institution admin
-            - 503: Database unavailable
-    """
-    institution_id = UUID(payload["institution_id"])
-    
-    # For MVP, return basic structure
-    # Full analytics implementation would be in a separate analytics service
+    """Get aggregated analytics for all students linked to the institution."""
     try:
-        # Get student count
-        student_count = (
-            db.query(User)
-            .filter(User.institution_id == institution_id)
-            .count()
-        )
+        institution_id = UUID(payload["institution_id"])
+        
+        student_users = db.query(User).filter(
+            User.institution_id == institution_id,
+            User.role == "student"
+        ).order_by(User.created_at.desc()).all()
+        
+        performances = [_compute_student_performance(db, st) for st in student_users]
+        
+        total_students = len(student_users)
+        active_students = sum(1 for p in performances if p["total_tests_taken"] > 0)
+        scores = [p["avg_score"] for p in performances if p["total_tests_taken"] > 0]
+        overall_avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+        
+        total_passes = sum(p["pass_count"] for p in performances)
+        total_attempts = sum(p["total_tests_taken"] for p in performances)
+        overall_pass_rate = round((total_passes / total_attempts) * 100.0, 1) if total_attempts > 0 else 0.0
+
+        student_list_with_perf = []
+        for st, p in zip(student_users, performances):
+            student_list_with_perf.append({
+                "user_id": str(st.id),
+                "name": st.display_name or st.email,
+                "email": st.email,
+                "kcet_student_id": st.kcet_student_id or "—",
+                "batch_name": st.batch.name if getattr(st, "batch", None) else None,
+                "joined_at": st.created_at.isoformat() if st.created_at else None,
+                **p
+            })
+        
+        top_performers = sorted(
+            [s for s in student_list_with_perf if s["total_tests_taken"] > 0],
+            key=lambda x: x["avg_score"],
+            reverse=True
+        )[:5]
+        
+        needs_attention = [
+            s for s in student_list_with_perf
+            if s["total_tests_taken"] == 0 or s["avg_score"] < 50.0
+        ]
         
         return {
             "institution_id": str(institution_id),
-            "total_students": student_count,
-            "message": "Full analytics implementation pending",
+            "total_students": total_students,
+            "active_students": active_students,
+            "total_attempts": total_attempts,
+            "overall_avg_score": overall_avg_score,
+            "overall_pass_rate": overall_pass_rate,
+            "top_performers": top_performers,
+            "needs_attention": needs_attention,
+            "student_performance": student_list_with_perf,
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        import logging
+        logging.getLogger("smartkcet.institution").error("Analytics error: %s", str(e), exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={
-                "error": "internal_error",
-                "message": str(e),
-            },
+            detail={"error": "internal_error", "message": "Unable to calculate student analytics"}
         )
+
+
+@router.route("/students/<student_id>/performance", methods=["GET"])
+def get_student_detail_performance(student_id: str):
+    payload = require_institution_admin()
+    from flask import g
+    db = getattr(g, "db", None)
+    inst_id = UUID(payload["institution_id"])
+    
+    try:
+        s_uuid = UUID(student_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail={"error": "invalid_student_id"})
+
+    student = db.query(User).filter(User.id == s_uuid, User.institution_id == inst_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail={"error": "student_not_found"})
+
+    perf = _compute_student_performance(db, student)
+    
+    from ..db.models import Submission, ExamSet, Exam
+    subs = (
+        db.query(Submission, ExamSet, Exam)
+        .join(ExamSet, ExamSet.id == Submission.exam_set_id)
+        .join(Exam, Exam.id == ExamSet.exam_id)
+        .filter(Submission.user_id == student.id)
+        .order_by(desc(Submission.submitted_at))
+        .all()
+    )
+    
+    history = [
+        {
+            "submission_id": str(s.id),
+            "exam_name": ex.exam_name,
+            "subject": ex.subject,
+            "set_label": es.set_label,
+            "score_pct": float(s.score_pct) if s.score_pct is not None else 0.0,
+            "time_taken_sec": s.time_taken_sec,
+            "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
+            "status": "PASS" if (s.score_pct and float(s.score_pct) >= 50.0) else "FAIL",
+        }
+        for s, es, ex in subs
+    ]
+
+    return {
+        "student": {
+            "user_id": str(student.id),
+            "name": student.display_name or student.email,
+            "email": student.email,
+            "kcet_student_id": student.kcet_student_id or "—",
+            "joined_at": student.created_at.isoformat() if student.created_at else None,
+            "batch_name": student.batch.name if getattr(student, "batch", None) else None,
+        },
+        "performance": perf,
+        "submission_history": history,
+    }
 
 
 @router.route(
@@ -569,6 +644,83 @@ def select_subscription_plan(data: InstitutionPlanSelect):
         )
 
 
+def _compute_student_performance(db: Any, student_user: Any)-> dict[str, Any]:
+    """Helper to compute aggregated performance metrics for a single student."""
+    from ..db.models import Submission, ExamSet, Exam
+    from sqlalchemy import desc
+    from datetime import datetime
+    
+    if not student_user:
+        return {
+            "total_tests_taken": 0,
+            "avg_score": 0.0,
+            "highest_score": 0.0,
+            "pass_count": 0,
+            "pass_rate_pct": 0.0,
+            "last_active": None,
+            "status": "Enrolled",
+            "subject_scores": {},
+        }
+        
+    subs = (
+        db.query(Submission)
+        .filter(Submission.user_id == student_user.id)
+        .order_by(desc(Submission.submitted_at))
+        .all()
+    )
+    total_tests = len(subs)
+    if total_tests == 0:
+        return {
+            "total_tests_taken": 0,
+            "avg_score": 0.0,
+            "highest_score": 0.0,
+            "pass_count": 0,
+            "pass_rate_pct": 0.0,
+            "last_active": student_user.created_at.isoformat() if student_user.created_at else None,
+            "status": "Enrolled",
+            "subject_scores": {},
+        }
+
+    scores = [float(s.score_pct) for s in subs if s.score_pct is not None]
+    avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+    highest_score = round(max(scores), 1) if scores else 0.0
+    pass_count = sum(1 for s in scores if s >= 50.0)
+    pass_rate_pct = round((pass_count / len(scores)) * 100.0, 1) if scores else 0.0
+    
+    last_sub_date = subs[0].submitted_at if subs[0].submitted_at else student_user.created_at
+    last_active_str = last_sub_date.isoformat() if last_sub_date else None
+
+    # Subject breakdown
+    subject_map = {}
+    for s in subs:
+        if s.score_pct is None:
+            continue
+        es = db.query(ExamSet).filter(ExamSet.id == s.exam_set_id).first()
+        ex = db.query(Exam).filter(Exam.id == es.exam_id).first() if es else None
+        sub_name = ex.subject if (ex and ex.subject) else "General"
+        if sub_name not in subject_map:
+            subject_map[sub_name] = []
+        subject_map[sub_name].append(float(s.score_pct))
+
+    subject_scores = {
+        sub: round(sum(vals) / len(vals), 1)
+        for sub, vals in subject_map.items() if vals
+    }
+
+    is_active = (datetime.utcnow() - last_sub_date).days <= 30 if last_sub_date else False
+
+    return {
+        "total_tests_taken": total_tests,
+        "avg_score": avg_score,
+        "highest_score": highest_score,
+        "pass_count": pass_count,
+        "pass_rate_pct": pass_rate_pct,
+        "last_active": last_active_str,
+        "status": "Active" if is_active else "Enrolled",
+        "subject_scores": subject_scores,
+    }
+
+
 @router.route("/dashboard", methods=["GET"])
 def get_institution_dashboard():    
     payload = require_institution_admin()
@@ -591,11 +743,13 @@ def get_institution_dashboard():
                 detail={"error": "institution_not_found", "message": "Institution not found"}
             )
 
-        # Student count (exclude institution_admin accounts)
-        total_students = db.query(User).filter(
+        # Student users (exclude institution_admin accounts)
+        student_users = db.query(User).filter(
             User.institution_id == institution_id,
             User.role == "student",
-        ).count()
+        ).order_by(desc(User.created_at)).all()
+
+        total_students = len(student_users)
 
         # Active subscription
         active_sub = (
@@ -615,17 +769,12 @@ def get_institution_dashboard():
 
         if active_sub and active_sub.plan:
             max_students = active_sub.plan.max_student_seats
-            # Use max_test_attempts_per_period for both weekly and monthly limits
             weekly_test_limit = active_sub.plan.max_test_attempts_per_period
             monthly_test_limit = active_sub.plan.max_test_attempts_per_period
             next_renewal_date = active_sub.next_renewal_date.isoformat() if active_sub.next_renewal_date else None
 
-        # Get all user IDs linked to this institution (students and admins)
-        all_user_ids = [
-            row[0] for row in db.query(User.id).filter(
-                User.institution_id == institution_id
-            ).all()
-        ]
+        # Get all user IDs linked to this institution
+        all_user_ids = [st.id for st in student_users]
 
         recent_submissions = []
         tests_this_week = 0
@@ -668,6 +817,7 @@ def get_institution_dashboard():
 
                     recent_submissions.append({
                         "student_name": student.display_name if (student and student.display_name) else (student.email if student else "Student"),
+                        "student_id": student.kcet_student_id if student else "—",
                         "subject": subject_name,
                         "score": round(s.score_pct, 1) if s.score_pct is not None else None,
                         "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
@@ -697,7 +847,6 @@ def get_institution_dashboard():
         tests_this_week = test_attempts_week + exams_created_week
         tests_this_month = test_attempts_month + exams_created_month
 
-        # Live dynamic counts as entries occur
         total_questions = db.query(Question).filter(
             Question.institution_id == institution_id
         ).count()
@@ -726,9 +875,41 @@ def get_institution_dashboard():
             if all_user_ids else 0
         )
 
+        # Compute student performance roster & analytics summary
+        students_performance = []
+        all_student_scores = []
+        for st in student_users:
+            perf = _compute_student_performance(db, st)
+            st_info = {
+                "user_id": str(st.id),
+                "email": st.email,
+                "display_name": st.display_name or st.email,
+                "kcet_student_id": st.kcet_student_id or "—",
+                "joined_at": st.created_at.isoformat() if st.created_at else None,
+                "batch_name": st.batch.name if getattr(st, "batch", None) else None,
+                **perf
+            }
+            students_performance.append(st_info)
+            if perf["total_tests_taken"] > 0:
+                all_student_scores.append(perf["avg_score"])
+
+        overall_avg_score = round(sum(all_student_scores) / len(all_student_scores), 1) if all_student_scores else 0.0
+
+        recent_students = [
+            {
+                "user_id": str(st.id),
+                "name": st.display_name or st.email,
+                "email": st.email,
+                "kcet_student_id": st.kcet_student_id or "—",
+                "joined_at": st.created_at.isoformat() if st.created_at else None,
+            }
+            for st in student_users[:5]
+        ]
+
         return {
             "institution_id": str(institution_id),
             "institution_name": institution.name,
+            "institution_code": institution.institution_code,
             "total_students": total_students,
             "max_students": max_students,
             "subscription_status": subscription_status,
@@ -742,8 +923,23 @@ def get_institution_dashboard():
             "total_exams": total_exams,
             "total_files": total_files,
             "total_attempts": total_attempts,
+            "overall_avg_score": overall_avg_score,
             "recent_submissions": recent_submissions,
+            "recent_students": recent_students,
+            "students_performance": students_performance,
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.getLogger("smartkcet.institution").error(
+            "Dashboard endpoint error: %s", str(e), exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "message": "Unable to load dashboard data"}
+        )
     
     except HTTPException:
         raise
@@ -1294,12 +1490,61 @@ def get_institution_student_performance():
     avg_score = round(sum(s["score_pct"] for s in submissions) / total, 1) if total else 0
     pass_rate = round(sum(1 for s in submissions if s["pass_flag"]) / total * 100, 1) if total else 0
 
+    inst_name = None
+    cohort_rank = "—"
+    cohort_rank_num = None
+    if user.institution_id:
+        from ..db.subscription_models import Institution
+        institution = db.query(Institution).filter(Institution.id == user.institution_id).first()
+        inst_name = institution.name if institution else None
+
+        inst_students = db.query(User.id).filter(
+            User.institution_id == user.institution_id,
+            User.role == "student"
+        ).all()
+        inst_student_ids = [r[0] for r in inst_students]
+
+        if inst_student_ids:
+            from sqlalchemy import func as sa_func
+            rank_rows = (
+                db.query(
+                    Submission.user_id,
+                    sa_func.avg(Submission.score_pct).label("avg_sc")
+                )
+                .filter(Submission.user_id.in_(inst_student_ids), Submission.status == "completed")
+                .group_by(Submission.user_id)
+                .order_by(sa_func.avg(Submission.score_pct).desc())
+                .all()
+            )
+            for idx, r in enumerate(rank_rows, start=1):
+                if r.user_id == user.id:
+                    cohort_rank_num = idx
+                    cohort_rank = f"#{idx} in {inst_name or 'Institution'}"
+                    break
+            if cohort_rank == "—" and total > 0:
+                cohort_rank = f"#1 in {inst_name or 'Institution'}"
+
+    student_id_val = user.kcet_student_id or str(user.id)
+
     return {
+        "student": {
+            "student_id": student_id_val,
+            "kcet_student_id": student_id_val,
+            "display_name": user.display_name or user.email,
+            "email": user.email,
+            "institution_id": str(user.institution_id) if user.institution_id else None,
+            "institution_name": inst_name,
+            "cohort_rank": cohort_rank,
+            "cohort_rank_num": cohort_rank_num,
+        },
         "submissions": submissions,
         "summary": {
             "total_exams": total,
+            "exams_taken": total,
             "avg_score": avg_score,
             "pass_rate": pass_rate,
+            "cohort_rank": cohort_rank,
+            "cohort_rank_num": cohort_rank_num,
         },
     }
 
@@ -1402,8 +1647,11 @@ def get_all_students():
             .all()
         )
 
-        students_formatted = [
-            {
+        students_formatted = []
+        for s in students_summary_list:
+            st_user = db.query(User).filter(User.id == s.user_id).first()
+            perf = _compute_student_performance(db, st_user) if st_user else {}
+            students_formatted.append({
                 "user_id": str(s.user_id),
                 "email": s.email,
                 "display_name": s.display_name,
@@ -1412,28 +1660,33 @@ def get_all_students():
                 "student_subtype": s.student_subtype,
                 "batch_id": str(s.batch_id) if s.batch_id else None,
                 "batch_name": s.batch_name,
-            }
-            for s in students_summary_list
-        ]
+                **perf
+            })
+
+        inst_students_formatted = []
+        for s in institution_students:
+            perf = _compute_student_performance(db, s)
+            inst_students_formatted.append({
+                "email": s.email,
+                "name": s.display_name or s.email,
+                "id": s.kcet_student_id,
+                "subtype": s.student_subtype,
+                "batch_name": s.batch.name if getattr(s, "batch", None) else None,
+                "joined_at": s.created_at.isoformat() if s.created_at else None,
+                **perf
+            })
 
         return {
             "institution_id": str(institution_id),
             "institution_name": institution.name,
+            "institution_code": institution.institution_code,
             "total_students": len(institution_students),
             "max_seats": max_seats,
             "students": students_formatted,
             "institution": {
                 "name": institution.name,
                 "code": institution.institution_code,
-                "students": [
-                    {
-                        "email": s.email,
-                        "name": s.display_name,
-                        "id": s.kcet_student_id,
-                        "subtype": s.student_subtype
-                    }
-                    for s in institution_students
-                ]
+                "students": inst_students_formatted
             },
             "direct_subscribers": [
                 {
