@@ -81,8 +81,8 @@ class InvitationAccept(BaseModel):
 
     code: str = Field(
         ...,
-        min_length=32,
-        description="Invitation code (minimum 32 alphanumeric characters)",
+        min_length=1,
+        description="Invitation code or institution code",
     )
 
 

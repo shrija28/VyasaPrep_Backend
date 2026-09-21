@@ -106,14 +106,21 @@ def get_uploaded_topics_for_subject(session: Optional[Session] = None, subject: 
         except Exception:
             filenames = []
 
-    # Only if NO files were ever uploaded in DB for this subject, fallback to data/textbooks
+    # Fallback to fetching textbook filenames directly from Supabase Storage 'vyasaprep-textbook' bucket
     if not filenames:
-        from pathlib import Path
-        tb_dir = Path("data/textbooks")
-        if tb_dir.exists():
-            for p in tb_dir.iterdir():
-                if p.is_file():
-                    filenames.append(p.name)
+        from .textbook_sync import list_all_supabase_textbooks
+        all_tb = list_all_supabase_textbooks()
+        subj_tb = all_tb.get(subject, [])
+        for item in subj_tb:
+            filenames.append(item["filename"])
+
+        if not filenames:
+            from pathlib import Path
+            tb_dir = Path("data/textbooks")
+            if tb_dir.exists():
+                for p in tb_dir.iterdir():
+                    if p.is_file():
+                        filenames.append(p.name)
 
     official_chapters = SUBJECT_CHAPTERS.get(subject, [])
     topics: list[str] = []

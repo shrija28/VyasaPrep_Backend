@@ -151,12 +151,10 @@ def list_published_exams()-> Any:
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
 
-    # ── Strict exam isolation ────────────────────────────────────────────────
-    # Access matrix:
-    #   direct_subscriber  → platform-wide exams only (institution_id IS NULL)
-    #   institution_linked → their institution's exams AND platform-wide exams (created by admin)
+    # ── Strict exam isolation (Permanent Policy) ──────────────────────────────
+    #   direct_subscriber  → platform-wide admin exams only (institution_id IS NULL)
+    #   institution_linked → their institution's exams AND platform-wide admin exams
     if student_subtype == "institution_linked" and student_institution_id is not None:
-        # Institution student: see their institution's exams AND platform-wide admin exams
         try:
             inst_uuid = uuid.UUID(student_institution_id)
         except ValueError:
@@ -164,7 +162,7 @@ def list_published_exams()-> Any:
         from sqlalchemy import or_
         stmt = stmt.where(or_(Exam.institution_id == inst_uuid, Exam.institution_id.is_(None)))
     else:
-        # Personal student (direct_subscriber or no subtype): platform-wide only
+        # Personal student / direct subscriber: platform-wide admin exams only
         stmt = stmt.where(Exam.institution_id.is_(None))
 
     if selected is not None:
@@ -310,18 +308,21 @@ def get_exam_set_questions(exam_set_id: str)-> Any:
     if exam is None or not exam.is_published:
         return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
 
-    # ── Ownership check: enforce strict exam isolation ───────────────────────
-    # Institution student → can only access their institution's exams
-    # Personal student   → can only access platform-wide exams (institution_id IS NULL)
+    # ── Strict exam isolation check ──────────────────────────────────────────
+    from ..middleware.rbac import current_user
+    user = current_user(request, session)
     student_subtype = _student.get("student_subtype", "direct_subscriber")
     student_institution_id = _student.get("institution_id")
+    if user and user.institution_id:
+        student_institution_id = str(user.institution_id)
+        student_subtype = "institution_linked"
 
-    if student_subtype == "institution_linked":
-        # Must belong to their institution OR be platform-wide (created by admin)
+    if student_subtype == "institution_linked" and student_institution_id is not None:
+        # Must belong to their institution OR be platform-wide admin exam
         if exam.institution_id is not None and str(exam.institution_id) != str(student_institution_id):
             return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
     else:
-        # Personal student: must be platform-wide (institution_id IS NULL)
+        # Direct subscriber: platform-wide admin exam only
         if exam.institution_id is not None:
             return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
 

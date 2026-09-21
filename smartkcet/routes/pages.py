@@ -19,7 +19,7 @@ _LEGACY_HTML_DIR = _PROJECT_ROOT / "frontend" / "html"
 
 
 def _send_spa():
-    """Serve the production React build when available; otherwise fall back to legacy HTML."""
+    """Serve the production React build when available; otherwise fall back to dev mode info."""
     index_path = _DIST_DIR / "index.html"
     if index_path.exists():
         return send_from_directory(str(_DIST_DIR), "index.html")
@@ -28,7 +28,15 @@ def _send_spa():
     if fallback.exists():
         return send_file(str(fallback), mimetype="text/html")
 
-    return "Frontend build not found", 503
+    return (
+        "<html><head><title>VyasaPrep Backend</title></head><body style='font-family:sans-serif;padding:2.5rem;line-height:1.6;'>"
+        "<h2 style='color:#1e293b;'>VyasaPrep Backend API Server is Running!</h2>"
+        "<p style='color:#475569;'>You are accessing the <b>Flask Backend API</b> (Port 8000).</p>"
+        "<p style='color:#475569;'>To use the VyasaPrep App, please open the React Frontend in your browser at: <br/>"
+        "<a href='http://localhost:5173' style='font-size:1.25rem;color:#4f46e5;font-weight:bold;'>http://localhost:5173</a></p>"
+        "</body></html>",
+        200
+    )
 
 
 @router.route("/", methods=["GET"])

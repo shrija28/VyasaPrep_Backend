@@ -57,10 +57,12 @@ class SmartKcetFlask(Flask):
 
 
 def create_app():
-    frontend_dist = Path(__file__).resolve().parents[2] / 'frontend-react' / 'dist'
+    frontend_dist = Path(__file__).resolve().parents[2] / 'VyasaPrep_Frontend' / 'dist'
+    if not frontend_dist.exists():
+        frontend_dist = Path(__file__).resolve().parents[1].parent / 'VyasaPrep_Frontend' / 'dist'
     app = SmartKcetFlask(
         __name__,
-        static_folder=str(frontend_dist / 'assets'),
+        static_folder=str(frontend_dist / 'assets') if frontend_dist.exists() else None,
         static_url_path='/assets'
     )
     CORS(app, resources={r"/*": {"origins": "*"}})
@@ -107,8 +109,11 @@ def create_app():
     app.register_blueprint(pages_router)
     app.register_blueprint(legacy_router)
 
-    from .admin.syllabus import list_syllabus_public, get_syllabus_by_subject
+    from .admin.syllabus import list_syllabus_public, get_syllabus_by_subject, download_textbook, list_available_textbooks, get_topic_counts
     app.add_url_rule("/api/syllabus", "public_syllabus", list_syllabus_public, methods=["GET"])
+    app.add_url_rule("/api/syllabus/counts", "public_syllabus_counts", get_topic_counts, methods=["GET"])
+    app.add_url_rule("/api/syllabus/textbooks/available", "public_list_available_textbooks", list_available_textbooks, methods=["GET"])
+    app.add_url_rule("/api/syllabus/textbook/<path:filename>", "public_download_textbook", download_textbook, methods=["GET"])
     app.add_url_rule("/api/syllabus/<subject>", "public_syllabus_subject", get_syllabus_by_subject, methods=["GET"])
 
     @app.route("/api/health", methods=["GET"])
@@ -120,6 +125,18 @@ def create_app():
     def serve_react(filepath):
         if filepath.startswith("api/"):
             return jsonify({"detail": "Not Found"}), 404
+
+        index_file = frontend_dist / "index.html"
+        if not frontend_dist.exists() or not index_file.exists():
+            return (
+                "<html><head><title>VyasaPrep Backend</title></head><body style='font-family:sans-serif;padding:2rem;'>"
+                "<h2>VyasaPrep Backend API Server is Live & Running!</h2>"
+                "<p>The backend is active on <b>http://127.0.0.1:8000/api</b>.</p>"
+                "<p>Please open the React Frontend application in your browser at: "
+                "<a href='http://localhost:5173' style='font-size:1.2rem;color:#4f46e5;'><b>http://localhost:5173</b></a></p>"
+                "</body></html>",
+                200
+            )
 
         frontend_path = frontend_dist / filepath
         if filepath and frontend_path.is_file():

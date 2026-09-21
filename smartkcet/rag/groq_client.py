@@ -255,14 +255,20 @@ Below is the actual content from uploaded materials. Use ONLY these topics:
 Questions already used in other sets (DO NOT repeat these):
 {used_str}
 
-STRICT EXAM RULES:
-1. NO TRIVIAL/FACTUAL DEFINITIONS: Do NOT ask simple fact-retrieval questions.
-2. ENTRANCE EXAM LEVEL: Every question must be a problem-solving, calculation, application-based, or rigorous conceptual deduction question that matches the difficulty of a standard competitive entrance exam.
-3. SUBJECT-SPECIFIC STANDARDS:
-   - Mathematics: Focus on calculation-heavy problems. Use mathematical equations and variables in the question stem.
-   - Physics: Formulate numerical problems applying physics formulas (kinematics, electricity, circuits, work-energy, optics, electrostatics, modern physics, etc.). Include specific numerical values, units (m/s, N, J, V, A, Hz, kg, etc.), and step-by-step calculations. At least 60% of Physics questions MUST be numerical calculation problems.
-   - Chemistry: Include stoichiometry, organic reactions, physical chemistry numericals, etc.
-   - Biology: Focus on deep understanding, mechanisms, genetics.
+5 MANDATORY & PERMANENT EXAM RULES (MUST BE OBEYED STRICTLTY AT ALL TIMES):
+1. NO NUMERICAL VARIATIONS: DO NOT generate questions of the same type with different numerical values. Every question must present a distinct conceptual scenario.
+2. STANDARD KCET FORMAT: Every question must strictly adhere to the standard KCET entrance exam format (concise scientific stem, exactly 4 plausible options, 0-based integer answer index 0, 1, 2, or 3, 1 mark each).
+3. NO DUPLICATE QUESTIONS: DO NOT repeat any questions across sets or runs. Every question stem must be unique.
+4. STRICT INPUT-ONLY GROUNDING: Generate questions STRICTLY from the provided source content only. Do NOT make up questions not grounded in the input data.
+5. STRICT BLUEPRINT COMPLIANCE:
+   - Physics: Total Calculations 50% to 60% (Direct formula substitution 30% to 40%, Multi-step problem solving 15% to 20%), Pure theory and definition-based 40% to 50%.
+   - Chemistry: Numerical problems strictly 5 to 8 questions out of 60 (~8% to 12% / 10% to 15% from Physical Chemistry), Direct fact, memory, or reaction-based questions 88% to 92% (Organic and Inorganic Chemistry).
+
+SUBJECT-SPECIFIC STANDARDS:
+   - Physics: Follow the 50%-60% calculation vs 40%-50% theory breakdown.
+   - Chemistry: Follow the 5-8 numericals out of 60 vs 88%-92% fact/reaction breakdown.
+   - Mathematics: Focus on calculation-heavy problems. Use mathematical equations and variables in the stem.
+   - Biology: Focus on deep conceptual understanding, mechanisms, genetics, cellular processes, and physiological pathways.
 4. DISTRACTOR QUALITY & COMPLEXITY (CRITICAL):
    - Questions must require multiple steps to solve or combine at least two concepts.
    - The options (distractors) must be HIGHLY plausible. Use common student calculation errors, sign errors, and misconceptions as the incorrect options. Do NOT use obviously wrong, silly, or random options.
@@ -431,6 +437,13 @@ Questions already used in other sets (DO NOT repeat any of these):
 {used_str}
 
 {blueprint_rules}
+
+5 MANDATORY & PERMANENT EXAM RULES (MUST BE OBEYED STRICTLY AT ALL TIMES):
+1. NO NUMERICAL VARIATIONS: DO NOT generate questions of the same type with different numerical values. Every question must present a distinct conceptual scenario.
+2. STANDARD KCET FORMAT: Every question must strictly adhere to standard KCET entrance exam format (concise scientific stem, 4 plausible options, 0-based integer answer index 0, 1, 2, or 3, 1 mark each).
+3. NO DUPLICATE QUESTIONS: DO NOT repeat any questions across sets or runs. Every question stem must be unique.
+4. STRICT INPUT-ONLY GROUNDING: Base EVERY question STRICTLY on the source content provided above — do NOT make up questions not grounded in the input data.
+5. STRICT BLUEPRINT ENFORCEMENT: Strictly follow the subject blueprint rules above (Physics: 50%-60% calculations, 40%-50% theory; Chemistry: 5-8 numericals out of 60, 88%-92% fact/reaction).
 
 STRICT EXAM RULES:
 1. NO TRIVIAL/FACTUAL DEFINITIONS: Do NOT ask simple fact-retrieval questions.

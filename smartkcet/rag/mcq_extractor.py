@@ -1,12 +1,13 @@
 """Extract MCQ questions from text using pattern matching and domain validation.
 
-Looks for patterns like:
-- "1. Question text\n  a) option1\n  b) option2\n  c) option3\n  d) option4"
-- "Q1: Question text\n  A. option1\n  B. option2\n  C. option3\n  D. option4"
-- Numbered questions with lettered options (A/B/C/D or a/b/c/d or 1/2/3/4)
-
-Includes strict domain-relevance filtering and authentic subject question banks
-for Physics, Chemistry, Mathematics, and Biology.
+5 MANDATORY & PERMANENT EXAM RULES (ENFORCED ACROSS THE BACKEND):
+1. NO NUMERICAL VARIATIONS: DO NOT generate questions of the same type with different numerical values. Every question must be a unique conceptual scenario.
+2. STANDARD KCET FORMAT: Every question must strictly adhere to standard KCET entrance exam format (concise stem, 4 options, 0-based integer answer index, 1 mark each).
+3. NO DUPLICATE QUESTIONS: DO NOT repeat any questions across paper sets or runs. Every question text must be unique.
+4. STRICT INPUT-ONLY GROUNDING: Generate/extract questions STRICTLY from the provided source input content.
+5. STRICT BLUEPRINT ENFORCEMENT:
+   - Physics: Total Calculations 50% to 60% (Direct formula ~30%-40%, Multi-step ~15%-20%), Pure theory 40% to 50%.
+   - Chemistry: Total Calculations 10% to 15% (Physical Chemistry numericals strictly 5 to 8 out of 60), Direct fact, memory & reaction-based 88% to 92%.
 """
 
 from __future__ import annotations
@@ -2259,26 +2260,7 @@ def _generate_subject_variations(
                 }
                 if _add_q(q): return generated
 
-    # ── 3. Mathematics Templates ─────────────────────────────────────────────
-    elif "math" in topic_lower:
-        det_data = [
-            (2, 3, 1, 4), (5, 2, 3, 1), (4, 1, 2, 3), (6, 2, 4, 3),
-            (3, 1, 2, 5), (7, 2, 3, 1), (1, 4, 2, 5), (8, 3, 2, 4),
-            (9, 1, 3, 2), (6, 5, 2, 3), (7, 4, 1, 2), (5, 3, 4, 2)
-        ]
-        for a, b, c, d in det_data:
-            val = a * d - b * c
-            q = {
-                "q": f"If A is the 2x2 matrix [[{a}, {b}], [{c}, {d}]], then the determinant |A| is equal to:",
-                "opts": [f"{val}", f"{val + 2}", f"{val - 3}", f"{val * 2}"],
-                "ans": 0,
-                "topic": "Determinants",
-                "subtype": "direct_formula",
-                "exp": f"|A| = ({a})({d}) - ({b})({c}) = {a*d} - {b*c} = {val}."
-            }
-            if _add_q(q): return generated
-
-    # ── 3. Mathematics Variations ───────────────────────────────────────────
+    # ── 3. Mathematics Authentic Bank ───────────────────────────────────────────
     elif "math" in topic_lower:
         from .mathematics_bank import MATHEMATICS_BANK
         for q_item in MATHEMATICS_BANK:

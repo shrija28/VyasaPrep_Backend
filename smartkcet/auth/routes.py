@@ -115,6 +115,8 @@ class RegisterRequest(BaseModel):
     password: str
     display_name: str
     invite_code: Optional[str] = None  # If provided, auto-links to institution on signup
+    code: Optional[str] = None
+    institution_id: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -128,7 +130,8 @@ class LoginRequest(BaseModel):
 @router.route("/register", methods=["POST"])
 def register()-> Any:
     from flask import request
-    payload = RegisterRequest(**(request.get_json() or {}))
+    json_data = request.get_json() or {}
+    payload = RegisterRequest(**json_data)
     from flask import g
     session = getattr(g, "db", None)
     """Register a new student account.
@@ -175,54 +178,48 @@ def register()-> Any:
     institution_for_linking = None
     institution_student_id = None
     
-    if payload.invite_code and payload.invite_code.strip():
-        invite_code = payload.invite_code.strip()
+    raw_code = payload.invite_code or payload.code or payload.institution_id
+    if raw_code and str(raw_code).strip():
+        invite_code = str(raw_code).strip()
         try:
             from ..db.subscription_models import Invitation, Institution
             import logging as _log
+            from sqlalchemy import func, or_
             
             _logger = _log.getLogger("smartkcet.auth.register")
             
             invitation = session.query(Invitation).filter(
-                Invitation.code == invite_code,
+                func.lower(func.trim(Invitation.code)) == invite_code.lower(),
                 Invitation.status == "pending",
             ).first()
             
-            if invitation is None:
-                _logger.warning("Register invite-link: invitation code %r not found or not pending", invite_code)
-            elif invitation.expires_at is None or invitation.expires_at < datetime.utcnow():
-                _logger.warning("Register invite-link: invitation code %r expired (expires_at=%s)", invite_code, invitation.expires_at)
-                invitation = None
-            else:
-                # Get institution and check it has a code
+            if invitation and (invitation.expires_at is None or invitation.expires_at >= datetime.utcnow()):
                 institution_for_linking = session.query(Institution).filter(
                     Institution.id == invitation.institution_id
                 ).first()
-                
-                if institution_for_linking and institution_for_linking.institution_code:
-                    # Pre-generate institution-specific ID before creating user
-                    try:
-                        institution_student_id = next_institution_student_id(
-                            session, 
-                            str(invitation.institution_id)
-                        )
-                        _logger.info(
-                            "Pre-generated institution student ID: %s for institution: %s",
-                            institution_student_id,
-                            institution_for_linking.name
-                        )
-                    except Exception as e:
-                        _logger.warning("Failed to pre-generate institution student ID: %s", e)
-                        institution_student_id = None
-                else:
-                    _logger.warning(
-                        "Institution %s does not have institution_code set",
-                        institution_for_linking.id if institution_for_linking else invitation.institution_id
+            else:
+                # Check if raw_code matches an institution_code or name directly
+                inst_match = session.query(Institution).filter(
+                    or_(
+                        func.lower(func.trim(Institution.institution_code)) == invite_code.lower(),
+                        func.lower(func.trim(Institution.name)) == invite_code.lower(),
                     )
+                ).first()
+                if inst_match:
+                    institution_for_linking = inst_match
+
+            if institution_for_linking and institution_for_linking.institution_code:
+                try:
+                    institution_student_id = next_institution_student_id(
+                        session, 
+                        str(institution_for_linking.id)
+                    )
+                except Exception as e:
+                    institution_student_id = None
         except Exception as e:
             import logging
             logging.getLogger("smartkcet.auth").warning(
-                "Failed to validate invite code %s: %s", payload.invite_code, e
+                "Failed to validate invite code %s: %s", raw_code, e
             )
 
     # Step 4 — hashing. Reachable only when the email is free.
@@ -236,16 +233,28 @@ def register()-> Any:
         # Use generic KCET#### ID
         student_id = next_kcet_id(session)
 
-    # Step 6 — Create and persist user
+    # Step 6 — Create and persist user with institution linking if provided
+    initial_subtype = "institution_linked" if institution_for_linking else "direct_subscriber"
+    initial_inst_id = institution_for_linking.id if institution_for_linking else None
+    initial_batch_id = getattr(invitation, "batch_id", None) if invitation else None
+
     user = User(
         email=normalised_email,
         kcet_student_id=student_id,
         display_name=name_v,
         password_hash=password_hash,
         role="student",
-        student_subtype="direct_subscriber",  # default; may be changed below
+        student_subtype=initial_subtype,
+        institution_id=initial_inst_id,
+        batch_id=initial_batch_id,
     )
     session.add(user)
+
+    if invitation and invitation.status == "pending":
+        invitation.status = "consumed"
+        invitation.consumed_by = user.id
+        invitation.consumed_at = datetime.utcnow()
+
     try:
         session.commit()
     except IntegrityError:
@@ -256,38 +265,7 @@ def register()-> Any:
                 "message": "This email is already registered.",
             }), 409)
 
-    # Step 7 — If invite_code is valid, finalize institution linking
-    institution_name = None
-    institution_id_for_token = None
-    if invitation and institution_for_linking:
-        try:
-            from ..institution.service import InstitutionService
-            import logging as _log
-
-            _logger = _log.getLogger("smartkcet.auth.register")
-            
-            inst_service = InstitutionService(session)
-            inst_service.accept_invitation(invite_code, user.id)
-            # Refresh user to pick up institution_id and updated subtype
-            session.refresh(user)
-            # Ensure subtype is set
-            if user.student_subtype != "institution_linked":
-                user.student_subtype = "institution_linked"
-                session.commit()
-                session.refresh(user)
-            
-            institution_name = institution_for_linking.name
-            institution_id_for_token = str(user.institution_id) if user.institution_id else None
-            _logger.info(
-                "Register invite-link SUCCESS: user=%s subtype=%s institution_id=%s institution=%s",
-                user.kcet_student_id, user.student_subtype, user.institution_id, institution_name,
-            )
-        except Exception as e:
-            # Don't fail registration if invite linking fails — user is already created
-            import logging
-            logging.getLogger("smartkcet.auth").warning(
-                "Auto-link to institution failed for invite code %s: %s", payload.invite_code, e
-            )
+    institution_name = institution_for_linking.name if institution_for_linking else None
 
     # Step 8 — Build response message
     if institution_for_linking and institution_student_id:
@@ -312,6 +290,7 @@ def register()-> Any:
         # Build a JSONResponse so we can attach the cookie
         from fastapi.responses import JSONResponse as _JSONResponse
 
+        institution_id_for_token = str(user.institution_id) if user.institution_id else None
         # Issue JWT for the newly-registered institution student
         token, _jti, _iat, _exp = issue_token(
             sub=user.kcet_student_id,
@@ -454,13 +433,16 @@ def login()-> Any:
         institution_id=str(user.institution_id) if user.institution_id else None,
         subscription_status=subscription_status,
     )
+    is_institution_student = (user.student_subtype in ("institution_linked", "dual")) or (user.institution_id is not None)
+    redirect_path = "/student/institution/dashboard" if is_institution_student else "/dashboard"
+
     resp = make_response(jsonify({
         "kcet_student_id": user.kcet_student_id,
         "display_name": user.display_name,
         "role": "student",
         "student_subtype": user.student_subtype,
         # redirect hint for the client — institution students go to their platform
-        "redirect": "/student/institution/dashboard" if user.student_subtype == "institution_linked" else "/dashboard",
+        "redirect": redirect_path,
         # Include subscription selection flag for frontend popup logic
         "needs_subscription_selection": needs_subscription_selection,
     }))
@@ -473,7 +455,7 @@ def login()-> Any:
         user.student_subtype,
         user.institution_id,
         needs_subscription_selection,
-        "/student/institution/dashboard" if user.student_subtype == "institution_linked" else "/dashboard",
+        redirect_path,
     )
 
     return resp
@@ -672,13 +654,19 @@ def me()-> Any:
                 if inst:
                     result["institution_name"] = inst.name
 
-    # For institution_admin, include display name
+    # For institution_admin, include display name and institution details
     if role == "institution_admin":
         user = session.execute(
             select(User).where(User.email == sub, User.role == "institution_admin")
         ).scalar_one_or_none()
         if user:
             result["display_name"] = user.display_name
+            if user.institution_id:
+                result["institution_id"] = str(user.institution_id)
+                from ..db.subscription_models import Institution
+                inst = session.get(Institution, user.institution_id)
+                if inst:
+                    result["institution_name"] = inst.name
 
     return result
 

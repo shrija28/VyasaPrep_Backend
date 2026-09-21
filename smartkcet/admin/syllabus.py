@@ -61,15 +61,43 @@ def _serialise(t: SyllabusTopic)-> dict[str, Any]:
 
 TEXTBOOKS_DIR = PathlibPath(__file__).resolve().parent.parent.parent / "data" / "textbooks"
 
-@router.route("/syllabus/textbook/<filename>")
+@router.route("/syllabus/textbook/<path:filename>")
 def download_textbook(filename: str):
-    """Download/view an associated textbook file."""
-    file_path = TEXTBOOKS_DIR / filename
+    """Download/view an associated textbook file, streaming directly from Supabase Storage if missing locally."""
+    # 1. Check local disk first
+    clean_base = filename.split("/")[-1]
+    local_path = TEXTBOOKS_DIR / clean_base
+    if local_path.exists() and local_path.is_file():
+        return send_file(local_path, as_attachment=True, download_name=clean_base)
 
-    if not file_path.exists() or not file_path.is_file():
-        return jsonify({"detail": "Textbook file not found"}), 404
+    # 2. Stream directly from Supabase Storage in-memory (no local disk save)
+    from ..rag.textbook_sync import stream_textbook_from_supabase
+    res = stream_textbook_from_supabase(filename)
+    if res is not None:
+        stream, fname, size = res
+        return send_file(
+            stream,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=fname,
+        )
 
-    return send_file(file_path, as_attachment=True, download_name=filename)
+    return jsonify({"detail": f"Textbook file '{filename}' not found in Supabase or local storage."}), 404
+
+
+@router.route("/syllabus/textbooks/available", methods=["GET"])
+def list_available_textbooks():
+    """List all 128 textbook files available in Supabase Storage across Biology, Chemistry, Mathematics, Physics.
+
+    Accessible by both Admin and Institutions.
+    """
+    from ..rag.textbook_sync import list_all_supabase_textbooks
+    textbooks = list_all_supabase_textbooks()
+    total_count = sum(len(files) for files in textbooks.values())
+    return jsonify({
+        "total_textbooks": total_count,
+        "subjects": textbooks,
+    })
 
 def _validation_error(msg: str, field: Optional[str] = None):
     body: dict[str, Any] = {"error": "validation_error", "message": msg}
@@ -209,7 +237,6 @@ def get_syllabus_by_subject(subject: str)-> Any:
 
 @router.route("/syllabus/counts", methods=["GET"])
 def get_topic_counts()-> Any:    
-    _admin = require_admin()
     from flask import g
     db = getattr(g, "db", None)
     session = db

@@ -59,12 +59,20 @@ def require_institution_admin()-> dict:
             status_code=403,
             detail={"error": "forbidden", "message": "Institution admin access required"},
         )
-    from flask import request
+    from flask import request, g
     req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+    db = getattr(g, "db", None)
+
+    # Resolve institution_id from the admin's database User record if missing in payload
+    sub_claim = payload.get("sub")
+    if db and sub_claim and ("institution_id" not in payload or not payload.get("institution_id") or payload.get("institution_id") == "None"):
+        from ..db.models import User
+        admin_user = db.query(User).filter(User.email == sub_claim).first()
+        if admin_user and admin_user.institution_id:
+            payload["institution_id"] = str(admin_user.institution_id)
+
     if req_inst and str(req_inst).strip().lower() != "all":
         raw = str(req_inst).strip()
-        from flask import g
-        db = getattr(g, "db", None)
         if db:
             from ..db.subscription_models import Institution
             from sqlalchemy import func
@@ -75,15 +83,13 @@ def require_institution_admin()-> dict:
                 payload["institution_id"] = raw
         else:
             payload["institution_id"] = raw
-    elif "institution_id" not in payload or not payload.get("institution_id"):
-        from flask import g
-        db = getattr(g, "db", None)
-        if db:
-            from ..db.subscription_models import Institution
-            first_inst = db.query(Institution).first()
-            if first_inst:
-                payload["institution_id"] = str(first_inst.id)
+    elif ("institution_id" not in payload or not payload.get("institution_id") or payload.get("institution_id") == "None") and db:
+        from ..db.subscription_models import Institution
+        first_inst = db.query(Institution).first()
+        if first_inst:
+            payload["institution_id"] = str(first_inst.id)
     return payload
+
 
 
 @router.route(
@@ -230,11 +236,13 @@ def generate_invitation(data: Any = None):
 
 
 @router.route("/accept-invite", methods=["POST"])
-def accept_invitation(data: InvitationAccept):    
+def accept_invitation():    
     payload = require_authenticated()
-    from flask import g
+    from flask import g, request
     db = getattr(g, "db", None)
     session = db
+    raw_data = request.get_json() or {}
+    data = InvitationAccept(**raw_data)
     """Accept an institution invitation and link student to institution.
     
     **Requirements:** 9.2, 9.3, 9.4, 9.5
@@ -280,7 +288,28 @@ def accept_invitation(data: InvitationAccept):
     
     try:
         service.accept_invitation(data.code, student_id)
-        return None  # 204 No Content
+        db.refresh(user)
+        inst_id_str = str(user.institution_id) if user.institution_id else None
+
+        from ..auth.tokens import issue_token
+        from ..auth.routes import _set_session_cookie, STUDENT_TOKEN_TTL_SEC
+
+        token, _jti, _iat, _exp = issue_token(
+            sub=user.kcet_student_id,
+            role="student",
+            student_subtype="institution_linked",
+            institution_id=inst_id_str,
+        )
+
+        resp = make_response(jsonify({
+            "success": True,
+            "message": "Successfully joined institution",
+            "institution_id": inst_id_str,
+            "student_subtype": "institution_linked",
+            "token": token,
+        }), 200)
+        _set_session_cookie(resp, token, max_age=STUDENT_TOKEN_TTL_SEC)
+        return resp
     except InstitutionServiceError as e:
         error_msg = str(e)
         
@@ -388,76 +417,7 @@ def remove_student(student_id: UUID):
         )
 
 
-@router.route("/students", methods=["GET"])
-def get_institution_students():    
-    payload = require_institution_admin()
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
-    """List all students linked to the institution.
-    
-    **Requirements:** 7.4, 9.1
-    
-    Returns a list of students linked to the authenticated institution admin's
-    institution, including their basic information and link date.
-    
-    Args:
-        payload: JWT payload from authentication middleware
-        db: Database session
-        
-    Returns:
-        InstitutionStudentsResponse with student list
-        
-    Raises:
-        HTTPException:
-            - 403: Not an institution admin
-            - 503: Database unavailable
-    """
-    service = InstitutionService(db)
-    institution_id = UUID(payload["institution_id"])
-    
-    try:
-        # Get institution details
-        institution = (
-            db.query(Institution)
-            .filter(Institution.id == institution_id)
-            .first()
-        )
-        
-        if not institution:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": "institution_not_found",
-                    "message": f"Institution {institution_id} not found",
-                },
-            )
-        
-        # Get active subscription to determine max seats
-        active_subscription = (
-            db.query(Subscription)
-            .join(SubscriptionPlan, Subscription.plan_id == SubscriptionPlan.id)
-            .filter(
-                Subscription.institution_id == institution_id,
-                Subscription.status.in_(["trial", "active", "overdue", "grace_period"]),
-            )
-            .first()
-        )
-        
-        max_seats = None
-        if active_subscription and active_subscription.plan:
-            max_seats = active_subscription.plan.max_student_seats
-        
-        # Get students
-        students = service.get_institution_students(institution_id)
-        
-        return InstitutionStudentsResponse(
-            institution_id=institution_id,
-            institution_name=institution.name,
-            total_students=len(students),
-            max_seats=max_seats,
-            students=students,
-        )
+# GET /api/institution/students is implemented below in get_all_students() to provide a unified response
         
     except InstitutionServiceError as e:
         raise HTTPException(
@@ -907,7 +867,8 @@ def get_invitation_details(code: str):
     from ..db.subscription_models import Invitation
     from datetime import datetime
 
-    inv = db.query(Invitation).filter(Invitation.code == code).first()
+    from sqlalchemy import func
+    inv = db.query(Invitation).filter(func.lower(func.trim(Invitation.code)) == code.strip().lower()).first()
     if not inv:
         raise HTTPException(
             status_code=400,
@@ -966,14 +927,38 @@ def accept_invitation_by_code(code: str):
 
     try:
         service.accept_invitation(code, student_id)
-        institution_name = "your institution"
+        db.refresh(user)
+        inst_id_str = str(user.institution_id) if user.institution_id else None
+
         from ..db.subscription_models import Invitation
-        inv = db.query(Invitation).filter(Invitation.code == code).first()
+        from sqlalchemy import func
+        inv = db.query(Invitation).filter(func.lower(func.trim(Invitation.code)) == code.strip().lower()).first()
+        institution_name = "your institution"
         if inv:
             inst = db.query(Institution).filter(Institution.id == inv.institution_id).first()
             if inst:
                 institution_name = inst.name
-        return {"message": f"Successfully joined {institution_name}", "institution_name": institution_name}
+
+        from ..auth.tokens import issue_token
+        from ..auth.routes import _set_session_cookie, STUDENT_TOKEN_TTL_SEC
+
+        token, _jti, _iat, _exp = issue_token(
+            sub=user.kcet_student_id,
+            role="student",
+            student_subtype=user.student_subtype or "institution_linked",
+            institution_id=inst_id_str,
+        )
+
+        resp = make_response(jsonify({
+            "success": True,
+            "message": f"Successfully joined {institution_name}",
+            "institution_name": institution_name,
+            "institution_id": inst_id_str,
+            "student_subtype": user.student_subtype or "institution_linked",
+            "token": token,
+        }), 200)
+        _set_session_cookie(resp, token, max_age=STUDENT_TOKEN_TTL_SEC)
+        return resp
     except InstitutionServiceError as e:
         error_msg = str(e)
         if "Invalid invitation" in error_msg or "expired" in error_msg:
@@ -1006,8 +991,9 @@ def revoke_invitation(code: str):
         
         logger.info(f"Revoking invitation: original={code}, decoded={decoded_code}")
         
+        from sqlalchemy import func
         inv = db.query(Invitation).filter(
-            Invitation.code == decoded_code,
+            func.lower(func.trim(Invitation.code)) == decoded_code.strip().lower(),
             Invitation.institution_id == institution_id,
         ).first()
 
@@ -1355,7 +1341,13 @@ def get_all_students():
     }
     """
     try:
-        institution_id = UUID(auth.get("institution_id"))
+        institution_id_raw = payload.get("institution_id")
+        if not institution_id_raw:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "no_institution_id", "message": "No institution ID in session context"}
+            )
+        institution_id = UUID(str(institution_id_raw))
         
         # Get institution info
         institution = (
@@ -1370,6 +1362,24 @@ def get_all_students():
                 detail={"error": "institution_not_found", "message": "Institution not found"}
             )
         
+        # Get active subscription to determine max seats
+        active_subscription = (
+            db.query(Subscription)
+            .join(SubscriptionPlan, Subscription.plan_id == SubscriptionPlan.id)
+            .filter(
+                Subscription.institution_id == institution_id,
+                Subscription.status.in_(["trial", "active", "overdue", "grace_period"]),
+            )
+            .first()
+        )
+        
+        max_seats = None
+        if active_subscription and active_subscription.plan:
+            max_seats = active_subscription.plan.max_student_seats
+
+        service = InstitutionService(db)
+        students_summary_list = service.get_institution_students(institution_id)
+        
         # Get institution-linked students
         institution_students = (
             db.query(User)
@@ -1377,6 +1387,7 @@ def get_all_students():
                 User.institution_id == institution_id,
                 User.role == "student"
             )
+            .order_by(User.created_at)
             .all()
         )
         
@@ -1390,8 +1401,27 @@ def get_all_students():
             )
             .all()
         )
-        
+
+        students_formatted = [
+            {
+                "user_id": str(s.user_id),
+                "email": s.email,
+                "display_name": s.display_name,
+                "kcet_student_id": s.kcet_student_id,
+                "linked_at": s.linked_at.isoformat() if s.linked_at else None,
+                "student_subtype": s.student_subtype,
+                "batch_id": str(s.batch_id) if s.batch_id else None,
+                "batch_name": s.batch_name,
+            }
+            for s in students_summary_list
+        ]
+
         return {
+            "institution_id": str(institution_id),
+            "institution_name": institution.name,
+            "total_students": len(institution_students),
+            "max_seats": max_seats,
+            "students": students_formatted,
             "institution": {
                 "name": institution.name,
                 "code": institution.institution_code,
@@ -1416,10 +1446,12 @@ def get_all_students():
             ]
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         import logging
         logging.getLogger("smartkcet.institution").error(
-            "Error fetching students: %s", e
+            "Error fetching students: %s", e, exc_info=True
         )
         raise HTTPException(
             status_code=500,

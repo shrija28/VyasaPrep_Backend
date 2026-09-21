@@ -368,13 +368,37 @@ class InstitutionService:
             InstitutionServiceError: If invitation invalid, expired, seats full, or already linked
         """
         try:
-            # Fetch invitation
+            from sqlalchemy import func, or_
+            # Fetch invitation (case-insensitive and trimmed)
             invitation = (
                 self.db.query(Invitation)
-                .filter(Invitation.code == code)
+                .filter(func.lower(func.trim(Invitation.code)) == code.strip().lower())
                 .first()
             )
             
+            # Fallback: Check if code matches an Institution code or name directly
+            if not invitation:
+                inst_match = (
+                    self.db.query(Institution)
+                    .filter(
+                        or_(
+                            func.lower(func.trim(Institution.institution_code)) == code.strip().lower(),
+                            func.lower(func.trim(Institution.name)) == code.strip().lower(),
+                        )
+                    )
+                    .first()
+                )
+                if inst_match:
+                    unique_code = f"AUTO-{inst_match.institution_code.upper()}-{secrets.token_hex(4).upper()}"
+                    invitation = Invitation(
+                        institution_id=inst_match.id,
+                        code=unique_code,
+                        status="pending",
+                        expires_at=datetime.utcnow() + timedelta(days=7),
+                    )
+                    self.db.add(invitation)
+                    self.db.flush()
+
             # Check invitation exists and is pending (REQ-9.2, 9.3)
             if not invitation:
                 raise InstitutionServiceError("Invalid invitation code")

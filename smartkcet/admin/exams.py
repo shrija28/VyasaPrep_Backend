@@ -228,7 +228,7 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
     # Step 1: Query clean, unique questions stored in the Question Bank for this subject
     clean_questions = _get_clean_unique_questions(session, subject_val, source_filter)
 
-    # Prioritize questions not yet used in previous exams for this subject
+    # Query questions already linked to previous exams for this subject
     linked_stmt = (
         select(ExamSetQuestion.question_id)
         .join(ExamSet, ExamSet.id == ExamSetQuestion.exam_set_id)
@@ -237,25 +237,42 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
     )
     already_used_ids = set(session.execute(linked_stmt).scalars().all())
 
-    available_questions = [q for q in clean_questions if q.id not in already_used_ids]
-    if len(available_questions) < QUESTIONS_PER_SET:
-        available_questions = clean_questions
+    from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, normalize_question_fingerprint
 
-    # Guarantee at least 60 questions for the exam across full syllabus
-    if len(available_questions) < QUESTIONS_PER_SET:
-        from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question
-        needed = (QUESTIONS_PER_SET - len(available_questions)) + 20
-        used_texts = set(q.question_text for q in clean_questions if q.question_text)
+    already_used_fingerprints = {
+        normalize_question_fingerprint(q.question_text)
+        for q in clean_questions
+        if (q.id in already_used_ids and q.question_text)
+    }
+
+    # Exclude all questions already used in previous exams for this subject
+    available_questions = [
+        q for q in clean_questions
+        if q.id not in already_used_ids
+        and normalize_question_fingerprint(q.question_text) not in already_used_fingerprints
+    ]
+
+    # Guarantee at least QUESTIONS_PER_SET (60) FRESH, unrepeated questions across full syllabus
+    used_texts = set(already_used_fingerprints)
+    for q in clean_questions:
+        if q.question_text:
+            used_texts.add(q.question_text.strip())
+            used_texts.add(normalize_question_fingerprint(q.question_text))
+
+    while len(available_questions) < QUESTIONS_PER_SET:
+        needed = QUESTIONS_PER_SET - len(available_questions)
         topup_mcqs = extract_or_generate_mcqs(
             "",
             topic=subject_val,
-            min_questions=needed,
+            min_questions=needed + 10,
             used_questions=used_texts,
             allowed_topics=None,
         )
+        added_in_pass = 0
         for mcq in topup_mcqs:
             q_text = mcq.get("q", "").strip()
-            if not q_text or q_text in used_texts:
+            fp = normalize_question_fingerprint(q_text)
+            if not q_text or q_text in used_texts or fp in used_texts:
                 continue
             opts = mcq.get("opts", [])
             if not is_valid_question(q_text, opts, subject=subject_val):
@@ -266,7 +283,7 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
                 options=opts,
                 correct_option=str(mcq.get("ans", 0)),
                 topic=mcq.get("topic", subject_val),
-                generation_batch_id=uuid.uuid4(),
+                generation_batch_id=None,
                 institution_id=None,
                 source_type="textbook",
                 explanation=mcq.get("exp", ""),
@@ -274,12 +291,17 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
             session.add(row)
             available_questions.append(row)
             used_texts.add(q_text)
+            used_texts.add(fp)
+            added_in_pass += 1
             if len(available_questions) >= QUESTIONS_PER_SET:
                 break
         try:
-            session.flush()
-        except Exception:
+            session.commit()
+        except Exception as err:
             session.rollback()
+            logger.warning("Flush topup questions failed: %s", err)
+        if added_in_pass == 0:
+            break
 
     from ..rag.blueprint import allocate_blueprint_questions
 

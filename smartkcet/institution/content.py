@@ -800,7 +800,7 @@ def create_institution_exam()-> Any:
     scheduled_start_str = body.get("scheduled_start")
     scheduled_end_str = body.get("scheduled_end")
     is_published = body.get("is_published", True)
-    question_count = int(body.get("question_count") or 40)
+    question_count = 60 # Strictly 60 questions per set per user requirement
 
     selected = _normalise_subject(subject_raw)
     if selected is None:
@@ -869,7 +869,7 @@ def create_institution_exam()-> Any:
             seen_fingerprints.add(fp)
 
     num_sets = len(SET_LABELS)
-    target_per_set = max(1, question_count)
+    target_per_set = 60 # Strictly 60 questions per set
     total_needed = target_per_set
 
     # If available unused questions are less than total_needed, generate fresh non-repeating questions

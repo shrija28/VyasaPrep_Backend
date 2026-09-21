@@ -46,8 +46,15 @@ def _build_engine(database_url: str)-> Engine:
     if database_url.startswith("sqlite"):
         # FastAPI dependency-injection may share a session across threads.
         connect_args["check_same_thread"] = False
+        return create_engine(database_url, connect_args=connect_args, future=True)
 
-    return create_engine(database_url, connect_args=connect_args, future=True)
+    return create_engine(
+        database_url,
+        connect_args=connect_args,
+        future=True,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
 
 
 DATABASE_URL: str = _resolve_database_url()
