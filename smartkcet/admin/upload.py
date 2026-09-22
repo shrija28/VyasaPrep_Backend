@@ -166,11 +166,14 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
         if not q_text or not isinstance(opts, list) or len(opts) != 4:
             continue
 
+        from ..rag.mcq_extractor import shuffle_question_options
+        shuffled_opts, new_ans = shuffle_question_options(opts, ans_str)
+
         row = Question(
             subject=subject,
             question_text=q_text,
-            options=opts,
-            correct_option=ans_str,
+            options=shuffled_opts,
+            correct_option=str(new_ans),
             topic=topic if isinstance(topic, str) else "General",
             generation_batch_id=batch_id,
             institution_id=None,  # platform-wide

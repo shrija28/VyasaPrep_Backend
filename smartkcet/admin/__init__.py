@@ -40,6 +40,7 @@ from flask import Blueprint, request, g, make_response, jsonify, Response
 from ..middleware.rbac import require_admin
 from .analytics import router as analytics_router
 from .dashboard import router as dashboard_router
+from .direct_subscribers import router as direct_subscribers_router
 from .exams import router as exams_router
 from .generate import router as generate_router
 from .leaderboard import router as leaderboard_router
@@ -72,6 +73,7 @@ router.register_blueprint(analytics_router)
 router.register_blueprint(dashboard_router)
 router.register_blueprint(platform_admin_router)
 router.register_blueprint(syllabus_router)
+router.register_blueprint(direct_subscribers_router)
 
 
 __all__ = ["router"]

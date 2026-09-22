@@ -130,25 +130,13 @@ class PublishExamRequest(BaseModel):
 @router.route("/exams", methods=["POST"])
 def create_exam() -> Any:
     payload = CreateExamRequest(**(request.get_json() or {}))
-
     _admin = require_admin()
-
     db = getattr(g, "db", None)
     session = db
-    """Create one exam (1 row + 4 sets + 80 set-question links) atomically.
 
-    Supports two question sources:
-    - ``source='question_paper'``: draws from DB questions extracted from PYQ uploads
-    - ``source='textbook'``: generates fresh KCET-level MCQs live from textbook
-      chunks stored in the FAISS index via Groq LLM
-    - ``source=None``: draws from all questions in DB regardless of source
-
-    For 'textbook' source the flow is:
-    1. Pull all FAISS chunks for the subject (textbook content)
-    2. Call Groq 4 times (once per set A/B/C/D) with 20 questions each
-    3. Store the 80 generated questions in the DB as source_type='textbook'
-    4. Create the exam + sets + links pointing at the newly stored questions
-    """
+    inst_id = _get_effective_institution_id(_admin, session)
+    if inst_id and inst_id.lower() != "all":
+        payload.institution_id = inst_id
 
     selected = _normalise_subject(payload.subject)
     if selected is None:
@@ -162,7 +150,36 @@ def create_exam() -> Any:
     return _create_exam_from_db(payload, selected, session, source_filter=None)
 
 
-def _get_clean_unique_questions(session: Session, subject_val: str, source_filter: Optional[str] = None)-> list[Question]:
+def _get_effective_institution_id(payload: dict, session: Session) -> str:
+    from flask import request
+    sub = payload.get("sub") if isinstance(payload, dict) else None
+    role = payload.get("role") if isinstance(payload, dict) else None
+    
+    user_inst_id = payload.get("institution_id") if isinstance(payload, dict) else None
+    if session and sub and not user_inst_id:
+        from ..db.models import User
+        user_row = session.query(User).filter(User.email == sub).first()
+        if not user_row:
+            user_row = session.query(User).filter(User.kcet_student_id == sub).first()
+        if user_row and user_row.institution_id:
+            user_inst_id = str(user_row.institution_id)
+
+    # Institution users & institution admins are strictly locked to their institution_id
+    if role == "institution_admin" or (user_inst_id and role not in ("platform_admin", "admin")):
+        return str(user_inst_id)
+
+    # Platform admins can filter by query parameter or default to "all"
+    req_inst = request.args.get("institution_id")
+    if req_inst and str(req_inst).strip():
+        return str(req_inst).strip()
+
+    if user_inst_id:
+        return str(user_inst_id)
+
+    return "all"
+
+
+def _get_clean_unique_questions(session: Session, subject_val: str, source_filter: Optional[str] = None, institution_id: Optional[str] = None)-> list[Question]:
     """Return all valid, complete, deduplicated Question rows for the given subject,
     ordered with most recently added/generated questions prioritized."""
     from ..rag.mcq_extractor import is_valid_question
@@ -173,6 +190,20 @@ def _get_clean_unique_questions(session: Session, subject_val: str, source_filte
         .where(Question.subject == subject_val)
         .order_by(Question.created_at.desc(), Question.id.desc())
     )
+
+    if institution_id and str(institution_id).strip().lower() != "all":
+        inst_str = str(institution_id).strip().lower()
+        if inst_str in ("null", "none", "platform"):
+            stmt = stmt.where(Question.institution_id.is_(None))
+        else:
+            try:
+                inst_uuid = uuid.UUID(str(institution_id).strip())
+            except ValueError:
+                from ..db.subscription_models import Institution
+                inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
+                inst_uuid = inst_obj.id if inst_obj else None
+            if inst_uuid:
+                stmt = stmt.where(Question.institution_id == inst_uuid)
     if source_filter and source_filter not in ("all", ""):
         try:
             if source_filter in ("textbook", "rag"):
@@ -224,17 +255,25 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
     the 240 questions generated in the Question Bank.
     """
     subject_val = selected.value
+    inst_id_filter = payload.institution_id
 
-    # Step 1: Query clean, unique questions stored in the Question Bank for this subject
-    clean_questions = _get_clean_unique_questions(session, subject_val, source_filter)
+    # Step 1: Query clean, unique questions stored in the Question Bank for this subject & institution
+    clean_questions = _get_clean_unique_questions(session, subject_val, source_filter, institution_id=inst_id_filter)
 
-    # Query questions already linked to previous exams for this subject
+    # Query questions already linked to previous exams for this subject & institution
     linked_stmt = (
         select(ExamSetQuestion.question_id)
         .join(ExamSet, ExamSet.id == ExamSetQuestion.exam_set_id)
         .join(Exam, Exam.id == ExamSet.exam_id)
         .where(Exam.subject == subject_val)
     )
+    if inst_id_filter and inst_id_filter.lower() != "all":
+        try:
+            i_uuid = uuid.UUID(inst_id_filter)
+            linked_stmt = linked_stmt.where(Exam.institution_id == i_uuid)
+        except ValueError:
+            pass
+
     already_used_ids = set(session.execute(linked_stmt).scalars().all())
 
     from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, normalize_question_fingerprint
@@ -259,49 +298,21 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
             used_texts.add(q.question_text.strip())
             used_texts.add(normalize_question_fingerprint(q.question_text))
 
-    while len(available_questions) < QUESTIONS_PER_SET:
-        needed = QUESTIONS_PER_SET - len(available_questions)
-        topup_mcqs = extract_or_generate_mcqs(
-            "",
-            topic=subject_val,
-            min_questions=needed + 10,
-            used_questions=used_texts,
-            allowed_topics=None,
-        )
-        added_in_pass = 0
-        for mcq in topup_mcqs:
-            q_text = mcq.get("q", "").strip()
-            fp = normalize_question_fingerprint(q_text)
-            if not q_text or q_text in used_texts or fp in used_texts:
-                continue
-            opts = mcq.get("opts", [])
-            if not is_valid_question(q_text, opts, subject=subject_val):
-                continue
-            row = Question(
-                subject=subject_val,
-                question_text=q_text,
-                options=opts,
-                correct_option=str(mcq.get("ans", 0)),
-                topic=mcq.get("topic", subject_val),
-                generation_batch_id=None,
-                institution_id=None,
-                source_type="textbook",
-                explanation=mcq.get("exp", ""),
-            )
-            session.add(row)
-            available_questions.append(row)
-            used_texts.add(q_text)
-            used_texts.add(fp)
-            added_in_pass += 1
-            if len(available_questions) >= QUESTIONS_PER_SET:
-                break
+    topup_inst_uuid = None
+    if inst_id_filter and inst_id_filter.lower() != "all":
         try:
-            session.commit()
-        except Exception as err:
-            session.rollback()
-            logger.warning("Flush topup questions failed: %s", err)
-        if added_in_pass == 0:
-            break
+            topup_inst_uuid = uuid.UUID(inst_id_filter)
+        except ValueError:
+            pass
+
+    if len(available_questions) < QUESTIONS_PER_SET:
+        return make_response(jsonify({
+            "error": "insufficient_questions",
+            "subject": subject_val,
+            "count": len(available_questions),
+            "required": QUESTIONS_PER_SET,
+            "message": f"Not enough unused questions available in Question Bank for {subject_val} ({len(available_questions)} available, {QUESTIONS_PER_SET} required). Please upload more question papers first."
+        }), 422)
 
     from ..rag.blueprint import allocate_blueprint_questions
 
@@ -752,13 +763,7 @@ def list_exams() -> Any:
     db = getattr(g, "db", None)
     session = db
     subject = request.args.get("subject")
-    """List all exams with subject, creation date, published status, set_count.
-
-    REQ-7.6: the admin panel shows every exam regardless of publish
-    status.  Optional ``?subject=Biology`` filter scopes the list to a
-    single subject.  Sort order is ``created_at DESC`` so the freshly
-    created exam appears at the top.
-    """
+    inst_id = _get_effective_institution_id(_admin, session)
 
     selected: Optional[Subject] = None
     if subject is not None:
@@ -771,15 +776,27 @@ def list_exams() -> Any:
             )
         selected = normalised
 
-    # Compute set_count via a left join + group_by so we get one row per
-    # exam even when an exam has zero sets (which should not happen post
-    # task 7.1, but the join is defensive).
     stmt = (
         select(Exam, func.count(ExamSet.id).label("set_count"))
         .outerjoin(ExamSet, ExamSet.exam_id == Exam.id)
         .group_by(Exam.id)
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
+
+    if inst_id and inst_id.lower() != "all":
+        inst_str = inst_id.lower()
+        if inst_str in ("null", "none", "platform"):
+            stmt = stmt.where(Exam.institution_id.is_(None))
+        else:
+            try:
+                inst_uuid = uuid.UUID(inst_id)
+            except ValueError:
+                from ..db.subscription_models import Institution
+                inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
+                inst_uuid = inst_obj.id if inst_obj else None
+            if inst_uuid:
+                stmt = stmt.where(Exam.institution_id == inst_uuid)
+
     if selected is not None:
         stmt = stmt.where(Exam.subject == selected.value)
 

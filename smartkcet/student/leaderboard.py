@@ -31,6 +31,7 @@ from ..subscription.dependencies import get_access_control
 router = Blueprint("student_leaderboard", __name__)
 
 
+@router.route("/leaderboard", methods=["GET"])
 @router.route("/leaderboard/me", methods=["GET"])
 def student_leaderboard_me()-> Dict[str, Any]:    
     payload = require_student()
@@ -58,7 +59,7 @@ def student_leaderboard_me()-> Dict[str, Any]:
     
     student_kcet_id: str = payload.get("sub", "")
 
-    ranked = get_leaderboard(session)
+    ranked = get_leaderboard(session, institution_id=user.institution_id)
 
     total_ranked = len(ranked)
 
@@ -95,10 +96,11 @@ def student_leaderboard_me()-> Dict[str, Any]:
         "me": my_entry,
     }
     
-    # Filter leaderboard data based on subscription tier
-    filtered_data = access_control.filter_leaderboard_data(leaderboard_data, user.id)
+    # Filter leaderboard data based on subscription tier if access_control available
+    if access_control and hasattr(access_control, "filter_leaderboard_data"):
+        return access_control.filter_leaderboard_data(leaderboard_data, user.id)
     
-    return filtered_data
+    return leaderboard_data
 
 
 __all__ = ["router"]

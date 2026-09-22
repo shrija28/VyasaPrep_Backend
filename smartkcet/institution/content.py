@@ -151,23 +151,45 @@ QUESTIONS_PER_EXAM = QUESTIONS_PER_SET * len(SET_LABELS)  # 240
 
 def require_institution_admin()-> dict:    
     payload = require_authenticated()
-    if payload.get("role") not in ("institution_admin", "platform_admin", "admin"):
+    role = payload.get("role")
+    if role not in ("institution_admin", "platform_admin", "admin"):
         raise HTTPException(
             status_code=403,
             detail={"error": "forbidden", "message": "Institution admin access required"},
         )
-    from flask import request
-    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
-    if req_inst and str(req_inst).strip().lower() != "all":
-        payload["institution_id"] = str(req_inst).strip()
-    elif "institution_id" not in payload or not payload.get("institution_id"):
-        from flask import g
-        db = getattr(g, "db", None)
-        if db:
-            from ..db.subscription_models import Institution
-            first_inst = db.query(Institution).first()
-            if first_inst:
-                payload["institution_id"] = str(first_inst.id)
+    from flask import request, g
+    db = getattr(g, "db", None)
+
+    sub_claim = payload.get("sub")
+    if db and sub_claim:
+        from ..db.models import User
+        user_row = db.query(User).filter(User.email == sub_claim).first()
+        if not user_row:
+            user_row = db.query(User).filter(User.kcet_student_id == sub_claim).first()
+        if user_row and user_row.institution_id:
+            payload["institution_id"] = str(user_row.institution_id)
+
+    # Only platform admins can override institution_id via query/header
+    if role in ("platform_admin", "admin"):
+        req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+        if req_inst and str(req_inst).strip().lower() != "all":
+            raw = str(req_inst).strip()
+            if db:
+                from ..db.subscription_models import Institution
+                from sqlalchemy import func
+                inst = db.query(Institution).filter(func.lower(Institution.name) == raw.lower()).first()
+                if inst:
+                    payload["institution_id"] = str(inst.id)
+                else:
+                    payload["institution_id"] = raw
+            else:
+                payload["institution_id"] = raw
+
+    if not payload.get("institution_id") or payload.get("institution_id") == "None":
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "no_institution_linked", "message": "User is not linked to any institution"},
+        )
     return payload
 
 
@@ -177,37 +199,20 @@ def require_institution_admin()-> dict:
 
 def _institution_id(payload: dict)-> uuid.UUID:
     raw = payload.get("institution_id") if payload else None
-    if not raw:
-        from flask import request
-        raw = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
-    if not raw:
-        from flask import g
-        db = getattr(g, "db", None)
-        if db:
-            from ..db.subscription_models import Institution
-            first_inst = db.query(Institution).first()
-            if first_inst:
-                return first_inst.id
-        return uuid.UUID("5226e678-58c5-4a51-832a-1f658da152bd")
-    if isinstance(raw, uuid.UUID):
-        return raw
-    try:
-        return uuid.UUID(str(raw))
-    except ValueError:
-        from flask import g
-        db = getattr(g, "db", None)
-        if db:
-            from ..db.subscription_models import Institution
-            from sqlalchemy import func
-            inst = db.query(Institution).filter(
-                func.lower(Institution.name) == str(raw).strip().lower()
-            ).first()
-            if inst:
-                return inst.id
-            first_inst = db.query(Institution).first()
-            if first_inst:
-                return first_inst.id
-        return uuid.UUID("5226e678-58c5-4a51-832a-1f658da152bd")
+    if raw and raw != "None":
+        try:
+            return uuid.UUID(str(raw))
+        except ValueError:
+            pass
+    from flask import request, g
+    db = getattr(g, "db", None)
+    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+    if req_inst and req_inst != "None":
+        try:
+            return uuid.UUID(str(req_inst))
+        except ValueError:
+            pass
+    raise HTTPException(status_code=403, detail={"error": "no_institution_linked", "message": "No valid institution ID provided"})
 
 
 def check_subscription_active(db: Session, institution_id: uuid.UUID)-> bool:
@@ -276,6 +281,7 @@ def _record_indexed_file(db: Session, subject: str, filename: str, file_hash: st
 
 
 def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, institution_id: uuid.UUID)-> int:
+    from ..rag.mcq_extractor import shuffle_question_options
     stored = 0
     for mcq in mcqs:
         q_text = mcq.get("q", "").strip()
@@ -287,11 +293,12 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
         topic = mcq.get("topic", "General")
         if not q_text or not isinstance(opts, list) or len(opts) != 4:
             continue
+        shuffled_opts, new_ans = shuffle_question_options(opts, ans_str)
         row = Question(
             subject=subject,
             question_text=q_text,
-            options=opts,
-            correct_option=ans_str,
+            options=shuffled_opts,
+            correct_option=str(new_ans),
             topic=topic if isinstance(topic, str) else "General",
             generation_batch_id=batch_id,
             institution_id=institution_id,
@@ -345,10 +352,9 @@ def _serialise_question(row: Question)-> dict[str, Any]:
 
 
 def _counts_by_subject(session: Session, institution_id: uuid.UUID)-> dict[str, int]:
-    from sqlalchemy import or_
     rows = session.execute(
         select(Question.subject, func.count(Question.id))
-        .where(or_(Question.institution_id == institution_id, Question.institution_id.is_(None)))
+        .where(Question.institution_id == institution_id)
         .group_by(Question.subject)
     ).all()
     found = {s: int(c) for s, c in rows}
@@ -694,8 +700,7 @@ def list_institution_questions()-> Any:
     inst_id = _institution_id(payload)
     batch_id_arg = request.args.get("batch_id")
 
-    from sqlalchemy import or_
-    base_filter = [or_(Question.institution_id == inst_id, Question.institution_id.is_(None))]
+    base_filter = [Question.institution_id == inst_id]
     if batch_id_arg and batch_id_arg.strip():
         try:
             b_uuid = uuid.UUID(batch_id_arg.strip())
@@ -850,7 +855,6 @@ def create_institution_exam()-> Any:
     query_filters = [
         Question.subject == selected.value,
         Question.institution_id == inst_id,
-        func.length(Question.question_text) <= 220,
     ]
     if batch_id:
         query_filters.append(Question.generation_batch_id == batch_id)
@@ -872,53 +876,14 @@ def create_institution_exam()-> Any:
     target_per_set = 60 # Strictly 60 questions per set
     total_needed = target_per_set
 
-    # If available unused questions are less than total_needed, generate fresh non-repeating questions
-    if len(unused_ids) < total_needed:
-        needed = total_needed - len(unused_ids)
-        context_text = ""
-        try:
-            matched_chunks = stores.search(selected, selected.value, k=40)
-            if matched_chunks:
-                context_text = "\n\n".join(matched_chunks)
-        except Exception:
-            pass
-
-        fresh_mcqs = extract_or_generate_mcqs(context_text, topic=selected.value, min_questions=needed + 15, used_questions=seen_fingerprints)
-        gen_batch_id = uuid.uuid4()
-        for mcq in fresh_mcqs:
-            q_text = mcq.get("q", "").strip()
-            fp = normalize_question_fingerprint(q_text)
-            if not q_text or not fp or fp in seen_fingerprints:
-                continue
-            opts = mcq.get("opts", [])
-            ans = mcq.get("ans", 0)
-            if not isinstance(opts, list) or len(opts) != 4:
-                continue
-            shuffled_opts, new_ans = shuffle_question_options(opts, ans)
-            row = Question(
-                subject=selected.value,
-                question_text=q_text,
-                options=shuffled_opts,
-                correct_option=str(new_ans),
-                topic=mcq.get("topic", selected.value),
-                generation_batch_id=gen_batch_id,
-                institution_id=inst_id,
-                source_type="textbook",
-                explanation=mcq.get("exp", f"Solution derived from uploaded {selected.value} material."),
-            )
-            session.add(row)
-            session.flush()
-            unused_ids.append(row.id)
-            used_qids.add(row.id)
-            seen_fingerprints.add(fp)
-
+    # Requirement 1: GENERATE QUESTIONS FROM QUESTION BANK ONLY (no synthetic on-the-fly topup)
     if len(unused_ids) < total_needed:
         return make_response(jsonify({
             "error": "insufficient_questions",
             "subject": selected.value,
             "count": len(unused_ids),
             "required": total_needed,
-            "message": f"Not enough unused questions available for {selected.value}. Please upload more question papers or textbooks first."
+            "message": f"Not enough unused questions available in Question Bank for {selected.value} ({len(unused_ids)} available, {total_needed} required). Please upload more question papers first."
         }), 422)
 
     # Load candidate Question objects

@@ -20,54 +20,15 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("smartkcet.rag.ai_analyzer")
 
 
-def _is_correct(given: Any, ans: Any, opts: Any = None) -> bool:
-    """Helper to check correctness matching smartkcet scoring logic."""
-    if given is None or str(given).strip() == "":
-        return False
-    given_str = str(given).strip().lower()
-    ans_str = str(ans).strip().lower() if ans is not None else ""
+from ..submissions.scoring import _is_correct_answer, _resolve_option_index
 
-    if given_str == ans_str:
-        return True
-
-    letter_map = {"a": "0", "b": "1", "c": "2", "d": "3", "0": "0", "1": "1", "2": "2", "3": "3"}
-    if letter_map.get(given_str) == letter_map.get(ans_str):
-        return True
-
-    if opts and isinstance(opts, (list, tuple)):
-        try:
-            g_idx = int(letter_map.get(given_str, given_str))
-            if 0 <= g_idx < len(opts) and str(opts[g_idx]).strip().lower() == ans_str:
-                return True
-        except (ValueError, TypeError):
-            pass
-
-        try:
-            a_idx = int(letter_map.get(ans_str, ans_str))
-            if 0 <= a_idx < len(opts) and str(opts[a_idx]).strip().lower() == given_str:
-                return True
-        except (ValueError, TypeError):
-            pass
-
-        for idx, opt in enumerate(opts):
-            if str(opt).strip().lower() == ans_str and str(idx) == letter_map.get(given_str, given_str):
-                return True
-
-    return False
+_is_correct = _is_correct_answer
 
 
 def _get_option_index(value: Any, opts: list[str]) -> Optional[int]:
     """Resolve an option value (string, letter, or index) to an integer index (0-3)."""
-    if value is None or str(value).strip() == "":
-        return None
-    val_str = str(value).strip().lower()
-    letter_map = {"a": 0, "b": 1, "c": 2, "d": 3, "0": 0, "1": 1, "2": 2, "3": 3}
-    if val_str in letter_map:
-        return letter_map[val_str]
-    for idx, opt in enumerate(opts):
-        if str(opt).strip().lower() == val_str:
-            return idx
-    return None
+    idx, _text = _resolve_option_index(value, opts)
+    return idx
 
 
 def _synthesize_concept_explanation(q_text: str, topic: str, correct_opt: str) -> str:
@@ -101,6 +62,8 @@ def generate_offline_ai_analysis(
     from .mcq_extractor import infer_question_subtype
 
     total_questions = len(questions)
+    total_marks = 0
+    earned_marks = 0
     correct_count = 0
     incorrect_count = 0
     unanswered_count = 0
@@ -116,6 +79,16 @@ def generate_offline_ai_analysis(
         correct_ans_raw = q.get("ans", 0)
         topic = q.get("topic", "General") or "General"
         existing_exp = q.get("exp", "").strip()
+
+        # Coerce marks
+        q_marks_raw = q.get("marks")
+        q_marks = 1
+        if isinstance(q_marks_raw, int) and q_marks_raw > 0 and not isinstance(q_marks_raw, bool):
+            q_marks = q_marks_raw
+        elif isinstance(q_marks_raw, float) and q_marks_raw > 0:
+            q_marks = int(q_marks_raw)
+
+        total_marks += q_marks
 
         # Identify or infer question subtype
         subtype = q.get("subtype")
@@ -143,7 +116,7 @@ def generate_offline_ai_analysis(
         selected_opt_text = opts[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(opts) else None
 
         topic_breakdown.setdefault(topic, {"earned": 0, "total": 0})
-        topic_breakdown[topic]["total"] += 1
+        topic_breakdown[topic]["total"] += q_marks
 
         if given_val is None or str(given_val).strip() == "":
             status = "unanswered"
@@ -152,8 +125,9 @@ def generate_offline_ai_analysis(
         elif correct:
             status = "correct"
             correct_count += 1
+            earned_marks += q_marks
             subtype_stats[subtype]["correct"] += 1
-            topic_breakdown[topic]["earned"] += 1
+            topic_breakdown[topic]["earned"] += q_marks
             ai_note = f"Excellent execution! {subtype_label} solved with precision."
         else:
             status = "wrong"
@@ -179,7 +153,10 @@ def generate_offline_ai_analysis(
             "ai_feedback": ai_note,
         })
 
-    percentage = round((correct_count / max(1, total_questions)) * 100)
+    if score_data and "percentage" in score_data:
+        percentage = float(score_data["percentage"])
+    else:
+        percentage = round((earned_marks / max(1, total_marks)) * 100, 2) if total_marks > 0 else 0.0
 
     # Subtype breakdown compilation
     subtype_breakdown_dict = {}
@@ -426,8 +403,10 @@ def generate_offline_ai_analysis(
 
     return {
         "summary": {
-            "score": correct_count,
-            "total": total_questions,
+            "score": earned_marks,
+            "earned": earned_marks,
+            "total": total_marks,
+            "total_marks": total_marks,
             "percentage": percentage,
             "performance_band": band,
             "assessment": summary_text,

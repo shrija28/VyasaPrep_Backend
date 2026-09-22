@@ -109,9 +109,9 @@ def get_admin_dashboard()-> Any:
     # Total exam attempts (submissions)
     total_attempts = session.execute(select(func.count(Submission.id))).scalar_one()
 
-    # Average score across all submissions
+    # Average score across all completed submissions
     avg_score_result = session.execute(
-        select(func.avg(Submission.score_pct))
+        select(func.avg(Submission.score_pct)).where(Submission.status == "completed")
     ).scalar_one()
     avg_score = round(float(avg_score_result or 0), 1)
 

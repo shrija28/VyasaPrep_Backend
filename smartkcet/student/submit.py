@@ -129,16 +129,20 @@ def _load_exam_set_questions(session: Session, exam_set_id: uuid.UUID)-> list[di
         .order_by(ExamSetQuestion.order_index.asc())
     )
     rows = session.execute(stmt).all()
-    from ..rag.mcq_extractor import infer_question_subtype
+    from ..rag.mcq_extractor import infer_question_subtype, shuffle_options_for_set_label
+
+    exam_set = session.get(ExamSet, exam_set_id)
+    set_label = exam_set.set_label if exam_set is not None else "A"
 
     questions: list[dict[str, Any]] = []
     for question, _order in rows:
         st = infer_question_subtype(question.question_text, question.options or [], question.subject)
+        shuffled_opts, new_ans = shuffle_options_for_set_label(question.options or [], question.correct_option, set_label)
         questions.append(
             {
                 "q": question.question_text,
-                "opts": question.options,
-                "ans": question.correct_option,
+                "opts": shuffled_opts,
+                "ans": new_ans,
                 "topic": question.topic or "General",
                 "exp": question.explanation or "",
                 "subtype": st,
@@ -255,18 +259,35 @@ def submit()-> Any:
             replay_body["ai_analysis"] = ai_data
             replay_body["detailed_reviews"] = ai_data.get("detailed_reviews", []) if isinstance(ai_data, dict) else []
             summ = ai_data.get("summary", {}) if isinstance(ai_data, dict) else {}
-            replay_body["score"] = summ.get("score", summ.get("correct_count", 0))
-            replay_body["total_marks"] = summ.get("total", 60)
+            replay_body["score"] = summ.get("earned", summ.get("score", 0))
+            replay_body["total_marks"] = summ.get("total_marks", summ.get("total", 60))
             replay_body["percentage"] = summ.get("percentage", 0.0)
-            replay_body["correct_count"] = summ.get("correct_count", summ.get("score", 0))
+            replay_body["correct_count"] = summ.get("correct_count", 0)
             replay_body["incorrect_count"] = summ.get("incorrect_count", 0)
             replay_body["unanswered_count"] = summ.get("unanswered_count", 0)
         return make_response(jsonify(replay_body), 200)
 
-    # ---- Step 4: load questions + score + persist --------------------
     exam_set = session.get(ExamSet, exam_set_id)
     if exam_set is None:
         return _not_found("exam_set", exam_set_id)
+
+    exam = session.get(Exam, exam_set.exam_id) if exam_set else None
+    if exam is None or not exam.is_published:
+        return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
+
+    # Enforce strict institution exam isolation check
+    student_subtype = _student.get("student_subtype", "direct_subscriber")
+    student_institution_id = _student.get("institution_id")
+    if user and user.institution_id:
+        student_institution_id = str(user.institution_id)
+        student_subtype = "institution_linked"
+
+    if student_subtype == "institution_linked" and student_institution_id is not None:
+        if exam.institution_id is None or str(exam.institution_id) != str(student_institution_id):
+            return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
+    else:
+        if exam.institution_id is not None:
+            return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
 
     questions = _load_exam_set_questions(session, exam_set_id)
     if not questions:
@@ -276,8 +297,7 @@ def submit()-> Any:
                 "exam_set_id": str(exam_set_id),
             }), 422)
 
-    exam = session.get(Exam, exam_set.exam_id) if exam_set else None
-    subject_name = exam.subject if exam is not None else "General"
+    subject_name = exam.subject
 
     score = score_submission(questions, payload.answers)
     ai_analysis = analyze_student_submission(
@@ -365,12 +385,26 @@ def submit()-> Any:
         logger.warning("usage tracking record_attempt raised: %s", exc)
 
     summ = ai_analysis.get("summary", {}) if isinstance(ai_analysis, dict) else {}
-    earned = int(summ.get("score", score.get("earned", 0)))
-    total = int(summ.get("total", score.get("total", len(questions))))
-    pct = float(summ.get("percentage", score.get("percentage", 0.0)))
-    correct = int(summ.get("correct_count", earned))
-    incorrect = int(summ.get("incorrect_count", max(0, total - correct)))
-    unans = int(summ.get("unanswered_count", max(0, total - correct - incorrect)))
+    earned = int(score.get("earned", 0))
+    total = int(score.get("total", len(questions)))
+    pct = float(score.get("percentage", 0.0))
+
+    # Calculate exact counts from questionResults
+    q_results = score.get("questionResults", [])
+    correct = sum(1 for qr in q_results if qr.get("status") == "correct") if q_results else int(summ.get("correct_count", earned))
+    incorrect = sum(1 for qr in q_results if qr.get("status") == "wrong") if q_results else int(summ.get("incorrect_count", 0))
+    unans = sum(1 for qr in q_results if qr.get("status") == "unanswered") if q_results else int(summ.get("unanswered_count", 0))
+
+    # Synchronize ai_analysis summary values so they match score_submission output 100%
+    if isinstance(ai_analysis, dict) and "summary" in ai_analysis and isinstance(ai_analysis["summary"], dict):
+        ai_analysis["summary"]["score"] = earned
+        ai_analysis["summary"]["earned"] = earned
+        ai_analysis["summary"]["total"] = total
+        ai_analysis["summary"]["total_marks"] = total
+        ai_analysis["summary"]["percentage"] = pct
+        ai_analysis["summary"]["correct_count"] = correct
+        ai_analysis["summary"]["incorrect_count"] = incorrect
+        ai_analysis["summary"]["unanswered_count"] = unans
 
     response_body: dict[str, Any] = {
         "submission_id": str(submission.id),
@@ -426,6 +460,24 @@ def exam_set_status(exam_set_id: uuid.UUID)-> Any:
     exam_set = session.get(ExamSet, exam_set_id)
     if exam_set is None:
         return _not_found("exam_set", exam_set_id)
+
+    exam = session.get(Exam, exam_set.exam_id) if exam_set else None
+    if exam is None or not exam.is_published:
+        return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
+
+    # Enforce strict institution exam isolation check
+    student_subtype = _student.get("student_subtype", "direct_subscriber")
+    student_institution_id = _student.get("institution_id")
+    if user and user.institution_id:
+        student_institution_id = str(user.institution_id)
+        student_subtype = "institution_linked"
+
+    if student_subtype == "institution_linked" and student_institution_id is not None:
+        if exam.institution_id is not None and str(exam.institution_id) != str(student_institution_id):
+            return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
+    else:
+        if exam.institution_id is not None:
+            return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
 
     stmt = (
         select(Submission)

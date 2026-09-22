@@ -54,40 +54,45 @@ router.register_blueprint(content.router, tags=["institution-content"])
 
 def require_institution_admin()-> dict:
     payload = require_authenticated()
-    if payload.get("role") not in ("institution_admin", "platform_admin", "admin"):
+    role = payload.get("role")
+    if role not in ("institution_admin", "platform_admin", "admin"):
         raise HTTPException(
             status_code=403,
             detail={"error": "forbidden", "message": "Institution admin access required"},
         )
     from flask import request, g
-    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
     db = getattr(g, "db", None)
 
-    # Resolve institution_id from the admin's database User record if missing in payload
     sub_claim = payload.get("sub")
-    if db and sub_claim and ("institution_id" not in payload or not payload.get("institution_id") or payload.get("institution_id") == "None"):
+    if db and sub_claim:
         from ..db.models import User
         admin_user = db.query(User).filter(User.email == sub_claim).first()
+        if not admin_user:
+            admin_user = db.query(User).filter(User.kcet_student_id == sub_claim).first()
         if admin_user and admin_user.institution_id:
             payload["institution_id"] = str(admin_user.institution_id)
 
-    if req_inst and str(req_inst).strip().lower() != "all":
-        raw = str(req_inst).strip()
-        if db:
-            from ..db.subscription_models import Institution
-            from sqlalchemy import func
-            inst = db.query(Institution).filter(func.lower(Institution.name) == raw.lower()).first()
-            if inst:
-                payload["institution_id"] = str(inst.id)
+    # Only platform admins can override institution_id via query/header
+    if role in ("platform_admin", "admin"):
+        req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+        if req_inst and str(req_inst).strip().lower() != "all":
+            raw = str(req_inst).strip()
+            if db:
+                from ..db.subscription_models import Institution
+                from sqlalchemy import func
+                inst = db.query(Institution).filter(func.lower(Institution.name) == raw.lower()).first()
+                if inst:
+                    payload["institution_id"] = str(inst.id)
+                else:
+                    payload["institution_id"] = raw
             else:
                 payload["institution_id"] = raw
-        else:
-            payload["institution_id"] = raw
-    elif ("institution_id" not in payload or not payload.get("institution_id") or payload.get("institution_id") == "None") and db:
-        from ..db.subscription_models import Institution
-        first_inst = db.query(Institution).first()
-        if first_inst:
-            payload["institution_id"] = str(first_inst.id)
+
+    if not payload.get("institution_id") or payload.get("institution_id") == "None":
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "no_institution_linked", "message": "User is not linked to any institution"},
+        )
     return payload
 
 
@@ -1400,7 +1405,7 @@ def get_institution_student_leaderboard():
     sub_claim = payload.get("sub", "")
 
     # Get all students in this institution
-    students = db.query(User).filter(User.institution_id == institution_id).all()
+    students = db.query(User).filter(User.institution_id == institution_id, User.role == "student").all()
     student_map = {str(s.id): s for s in students}
     student_ids = list(student_map.keys())
 
@@ -1467,7 +1472,7 @@ def get_institution_student_performance():
         db.query(Submission, ExamSet, Exam)
         .join(ExamSet, ExamSet.id == Submission.exam_set_id)
         .join(Exam, Exam.id == ExamSet.exam_id)
-        .filter(Submission.user_id == user.id)
+        .filter(Submission.user_id == user.id, Submission.status == "completed")
         .order_by(Submission.submitted_at.desc())
         .limit(100)
         .all()
@@ -1636,20 +1641,12 @@ def get_all_students():
             .all()
         )
         
-        # Get all direct subscribers (not linked to any institution)
-        direct_subscribers = (
-            db.query(User)
-            .filter(
-                User.student_subtype == "direct_subscriber",
-                User.institution_id.is_(None),
-                User.role == "student"
-            )
-            .all()
-        )
+        # Direct subscribers registered outside the institution are strictly excluded from the institution platform
+        direct_subscribers = []
 
         students_formatted = []
         for s in students_summary_list:
-            st_user = db.query(User).filter(User.id == s.user_id).first()
+            st_user = db.query(User).filter(User.id == s.user_id, User.institution_id == institution_id).first()
             perf = _compute_student_performance(db, st_user) if st_user else {}
             students_formatted.append({
                 "user_id": str(s.user_id),
@@ -1688,15 +1685,7 @@ def get_all_students():
                 "code": institution.institution_code,
                 "students": inst_students_formatted
             },
-            "direct_subscribers": [
-                {
-                    "email": s.email,
-                    "name": s.display_name,
-                    "id": s.kcet_student_id,
-                    "subtype": s.student_subtype
-                }
-                for s in direct_subscribers
-            ]
+            "direct_subscribers": []
         }
         
     except HTTPException:
@@ -1846,6 +1835,18 @@ def assign_student_batch(student_id: str):
         "batch_name": batch_name,
         "message": "Student batch updated successfully"
     })
+
+
+@router.route("/questions", methods=["GET"])
+def get_institution_questions_alias():
+    from .content import list_institution_questions
+    return list_institution_questions()
+
+
+@router.route("/exams", methods=["GET"])
+def get_institution_exams_alias():
+    from .content import list_institution_exams
+    return list_institution_exams()
 
 
 __all__ = ["router"]

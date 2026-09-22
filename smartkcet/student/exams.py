@@ -151,16 +151,15 @@ def list_published_exams()-> Any:
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
 
-    # ── Strict exam isolation (Permanent Policy) ──────────────────────────────
+    # ── Strict exam isolation ──────────────────────────────
     #   direct_subscriber  → platform-wide admin exams only (institution_id IS NULL)
-    #   institution_linked → their institution's exams AND platform-wide admin exams
+    #   institution_linked → their institution's exams only (institution_id == user.institution_id)
     if student_subtype == "institution_linked" and student_institution_id is not None:
         try:
             inst_uuid = uuid.UUID(student_institution_id)
         except ValueError:
             inst_uuid = student_institution_id
-        from sqlalchemy import or_
-        stmt = stmt.where(or_(Exam.institution_id == inst_uuid, Exam.institution_id.is_(None)))
+        stmt = stmt.where(Exam.institution_id == inst_uuid)
     else:
         # Personal student / direct subscriber: platform-wide admin exams only
         stmt = stmt.where(Exam.institution_id.is_(None))
@@ -212,6 +211,18 @@ def list_published_exams()-> Any:
 
         assigned_set = sets_payload[assigned_idx] if sets_payload else {}
 
+        # Query exact count of questions linked to the assigned exam set created by institution
+        actual_q_count = 60
+        if assigned_set.get("exam_set_id"):
+            try:
+                set_uuid = _uuid.UUID(assigned_set["exam_set_id"])
+                actual_q_count = int(session.execute(
+                    select(func.count(ExamSetQuestion.question_id))
+                    .where(ExamSetQuestion.exam_set_id == set_uuid)
+                ).scalar_one() or 60)
+            except Exception:
+                actual_q_count = 60
+
         bucket = buckets.setdefault(exam.subject, [])
         bucket.append(
             {
@@ -221,9 +232,9 @@ def list_published_exams()-> Any:
                     created_at.isoformat() if created_at is not None else None
                 ),
                 "set_count": len(sets_payload) or int(set_count or 0),
-                "question_count": getattr(exam, 'questions_per_set', 60) or 60,
+                "question_count": actual_q_count,
                 "duration_minutes": exam.duration_minutes or 60,
-                "total_marks": exam.total_marks or 60,
+                "total_marks": exam.total_marks or actual_q_count,
                 "scheduled_start": exam.scheduled_start.isoformat() if exam.scheduled_start else None,
                 "scheduled_end": exam.scheduled_end.isoformat() if exam.scheduled_end else None,
                 "institution_id": str(exam.institution_id) if exam.institution_id else None,
@@ -326,38 +337,7 @@ def get_exam_set_questions(exam_set_id: str)-> Any:
         if exam.institution_id is not None:
             return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
 
-    # Ensure set questions are synchronized with Set A's question pool in shuffled order sequence
-    sets = session.execute(
-        select(ExamSet).where(ExamSet.exam_id == exam.id).order_by(ExamSet.set_label.asc())
-    ).scalars().all()
-    if sets and len(sets) > 1 and exam_set.id != sets[0].id:
-        set_a_qids = session.execute(
-            select(ExamSetQuestion.question_id)
-            .where(ExamSetQuestion.exam_set_id == sets[0].id)
-            .order_by(ExamSetQuestion.order_index.asc())
-        ).scalars().all()
-        cur_qids = session.execute(
-            select(ExamSetQuestion.question_id)
-            .where(ExamSetQuestion.exam_set_id == set_id)
-            .order_by(ExamSetQuestion.order_index.asc())
-        ).scalars().all()
-        base_set = set(set_a_qids)
-        base_list = list(set_a_qids)
-        if set_a_qids and (set(cur_qids) != base_set or list(cur_qids) == base_list):
-            from sqlalchemy import delete
-            import random
-            session.execute(delete(ExamSetQuestion).where(ExamSetQuestion.exam_set_id == set_id))
-            shuffled_qids = list(base_list)
-            random.shuffle(shuffled_qids)
-            if shuffled_qids == base_list and len(shuffled_qids) > 1:
-                shuffled_qids.reverse()
-            session.add_all([
-                ExamSetQuestion(exam_set_id=set_id, question_id=qid, order_index=idx)
-                for idx, qid in enumerate(shuffled_qids)
-            ])
-            session.commit()
-
-    # Load questions ordered by position
+    # Load questions ordered by position (fixed & immutable for this published exam set)
     stmt = (
         select(Question, ExamSetQuestion.order_index)
         .join(ExamSetQuestion, ExamSetQuestion.question_id == Question.id)

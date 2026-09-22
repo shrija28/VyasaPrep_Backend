@@ -47,17 +47,13 @@ def _std_dev(scores: List[float])-> float:
     return math.sqrt(variance)
 
 
-def _gather_student_stats(session: Session, subject: Optional[str] = None)-> Dict[str, StudentStats]:
+def _gather_student_stats(session: Session, subject: Optional[str] = None, institution_id: Optional[Any] = None)-> Dict[str, StudentStats]:
     """Query the database and build per-student stats.
 
-    When *subject* is provided, only submissions for exams of that subject
-    are considered, and students with zero submissions in that subject are
-    excluded from the returned dict.
-
-    Returns a dict mapping user_id (as string) to StudentStats.
+    When *institution_id* is provided, stats are strictly isolated to students
+    and exams belonging to that institution.
+    When *institution_id* is None, stats are strictly isolated to independent students and platform-wide exams.
     """
-    # Build the base query for submissions joined with exam_set -> exam
-    # to get the subject information
     query = (
         session.query(
             Submission.user_id,
@@ -65,8 +61,14 @@ def _gather_student_stats(session: Session, subject: Optional[str] = None)-> Dic
         )
         .join(ExamSet, Submission.exam_set_id == ExamSet.id)
         .join(Exam, ExamSet.exam_id == Exam.id)
+        .join(User, Submission.user_id == User.id)
         .filter(Submission.status == "completed")
     )
+
+    if institution_id is not None:
+        query = query.filter(User.institution_id == institution_id, Exam.institution_id == institution_id)
+    else:
+        query = query.filter(User.institution_id.is_(None), Exam.institution_id.is_(None))
 
     if subject is not None:
         query = query.filter(Exam.subject == subject)
@@ -82,7 +84,6 @@ def _gather_student_stats(session: Session, subject: Optional[str] = None)-> Dic
         user_scores[uid].append(row.score_pct)
 
     # Also get overall stats (unfiltered) for eligibility check
-    # when subject filter is applied
     overall_stats: Dict[str, tuple] = {}
     if subject is not None:
         overall_query = (
@@ -97,7 +98,6 @@ def _gather_student_stats(session: Session, subject: Optional[str] = None)-> Dic
         for row in overall_query.all():
             overall_stats[str(row.user_id)] = (row.count, float(row.avg))
     else:
-        # When no subject filter, overall stats are the same as filtered stats
         for uid, scores in user_scores.items():
             overall_stats[uid] = (len(scores), sum(scores) / len(scores))
 
@@ -107,7 +107,6 @@ def _gather_student_stats(session: Session, subject: Optional[str] = None)-> Dic
         avg_score = sum(scores) / len(scores) if scores else 0.0
         attempt_count = len(scores)
 
-        # Get overall stats for eligibility
         overall_count, overall_avg = overall_stats.get(uid, (attempt_count, avg_score))
 
         result[uid] = StudentStats(
@@ -143,26 +142,23 @@ def _get_user_info(session: Session, user_ids: List[str])-> Dict[str, tuple]:
     }
 
 
-def get_leaderboard(session: Session, subject: Optional[str] = None)-> List[RankedEntry]:
+def get_leaderboard(session: Session, subject: Optional[str] = None, institution_id: Optional[Any] = None)-> List[RankedEntry]:
     """Compute and return the ranked leaderboard.
 
     Args:
         session: SQLAlchemy session for DB queries.
-        subject: Optional subject filter. When provided, only submissions
-            for that subject are considered and students with zero
-            submissions in that subject are excluded (REQ-11.7).
+        subject: Optional subject filter.
+        institution_id: Optional institution filter for strict institution leaderboard isolation.
 
     Returns:
         A list of RankedEntry objects sorted by rank (ascending).
     """
-    # Validate subject if provided
     if subject is not None:
         valid_subjects = {s.value for s in Subject}
         if subject not in valid_subjects:
             return []
 
-    # Step 1: Gather per-student stats (filtered by subject if applicable)
-    all_stats = _gather_student_stats(session, subject=subject)
+    all_stats = _gather_student_stats(session, subject=subject, institution_id=institution_id)
 
     if not all_stats:
         return []

@@ -33,9 +33,11 @@ _DEFAULT_SQLITE_PATH = Path(__file__).resolve().parents[2] / "smartkcet.db"
 _DEFAULT_DATABASE_URL = _DEFAULT_POSTGRES_URL
 
 
-def _resolve_database_url()-> str:
-    """Read ``DATABASE_URL`` from the environment, falling back to PostgreSQL."""
+def _resolve_database_url() -> str:
+    """Read ``DATABASE_URL`` from the environment, falling back to PostgreSQL or SQLite if USE_SQLITE is set."""
 
+    if os.getenv("USE_SQLITE", "").lower() in ("1", "true", "yes"):
+        return f"sqlite:///{_DEFAULT_SQLITE_PATH}"
     return os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
 
 

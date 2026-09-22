@@ -135,6 +135,36 @@ def _serialise_question(row: Question)-> dict[str, Any]:
     }
 
 
+def _get_effective_institution_id(payload: dict, session: Session) -> str:
+    from flask import request
+    sub = payload.get("sub") if isinstance(payload, dict) else None
+    role = payload.get("role") if isinstance(payload, dict) else None
+    
+    user_inst_id = payload.get("institution_id") if isinstance(payload, dict) else None
+    if session and sub and not user_inst_id:
+        user_row = session.query(Question.__class__).none() if False else None
+        from ..db.models import User
+        user_row = session.query(User).filter(User.email == sub).first()
+        if not user_row:
+            user_row = session.query(User).filter(User.kcet_student_id == sub).first()
+        if user_row and user_row.institution_id:
+            user_inst_id = str(user_row.institution_id)
+
+    # Institution users & institution admins are strictly locked to their institution_id
+    if role == "institution_admin" or (user_inst_id and role not in ("platform_admin", "admin")):
+        return str(user_inst_id)
+
+    # Platform admins can filter by query parameter or default to "all"
+    req_inst = request.args.get("institution_id")
+    if req_inst and str(req_inst).strip():
+        return str(req_inst).strip()
+
+    if user_inst_id:
+        return str(user_inst_id)
+
+    return "all"
+
+
 def _counts_by_subject(session: Session, institution_id: Optional[str] = None)-> dict[str, int]:
     """Return a ``{subject_value: count}`` map for questions.
 
@@ -181,7 +211,7 @@ def list_counts() -> Any:
     uses this to decide whether to show the "fewer than 20" warning.
     """
 
-    inst_id = request.args.get("institution_id") or "all"
+    inst_id = _get_effective_institution_id(_admin, session)
     counts = _counts_by_subject(session, institution_id=inst_id)
     insufficient = {
         subject_value: total < INSUFFICIENT_THRESHOLD
@@ -206,27 +236,13 @@ def list_questions() -> Any:
     session = db
     subject = request.args.get("subject")
     source = request.args.get("source")
-    inst_id = request.args.get("institution_id") or "all"
+    inst_id = _get_effective_institution_id(_admin, session)
     try:
         page = int(request.args.get("page", 1))
         if page < 1:
             page = 1
     except (ValueError, TypeError):
         page = 1
-    """List questions with optional subject filter and stable pagination.
-
-    Query parameters
-    ----------------
-    subject
-        Optional KCET subject (one of ``Biology``, ``Physics``,
-        ``Chemistry``, ``Mathematics``).
-    source
-        Optional source filter (e.g. ``textbook``, ``question_paper``, ``rag``).
-    page
-        1-indexed page number.
-    page_size
-        Max number of questions per page (capped at 50).
-    """
 
     selected: Optional[Subject] = None
     if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):

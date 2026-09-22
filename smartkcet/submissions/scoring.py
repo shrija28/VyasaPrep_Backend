@@ -71,12 +71,12 @@ _IMPROVE_THRESHOLD = 40
 _PASS_THRESHOLD = 40
 
 
-def _pct(earned: int, total: int)-> int:
-    """Round earned/total to a percentage, returning 0 when total is 0."""
+def _pct(earned: int, total: int) -> float:
+    """Round earned/total to a percentage, returning 0.0 when total is 0."""
 
     if total <= 0:
-        return 0
-    return round((earned / total) * 100)
+        return 0.0
+    return round((earned / total) * 100, 2)
 
 
 def _normalised_marks(value: Any)-> int:
@@ -91,7 +91,41 @@ def _normalised_marks(value: Any)-> int:
     return 1
 
 
-def _is_correct_answer(given: Any, ans: Any, opts: Any = None)-> bool:
+def _resolve_option_index(val: Any, opts: Any = None) -> tuple[Optional[int], Optional[str]]:
+    """Resolve an option value (index "0".."3", letter "A".."D", or option text) to (index, clean_text)."""
+    if val is None:
+        return None, None
+    val_str = str(val).strip()
+    if not val_str:
+        return None, None
+
+    clean_opts: list[str] = []
+    if opts and isinstance(opts, (list, tuple)):
+        import re
+        clean_opts = [
+            re.sub(r"^\s*(?:\([A-Da-d1-4]\)|[A-Da-d1-4]\s*[.):\-]|option\s+[A-Da-d1-4]\s*[:\-]?)\s*", "", str(opt), flags=re.IGNORECASE).strip()
+            for opt in opts
+        ]
+
+    val_lower = val_str.lower()
+
+    # 1. Option text match first in clean_opts
+    if clean_opts:
+        for i, opt in enumerate(clean_opts):
+            if opt.lower() == val_lower:
+                return i, opt.lower()
+
+    # 2. Letter or index map ("a".."d", "0".."3")
+    letter_to_idx = {"a": 0, "b": 1, "c": 2, "d": 3, "0": 0, "1": 1, "2": 2, "3": 3}
+    if val_lower in letter_to_idx:
+        idx = letter_to_idx[val_lower]
+        text = clean_opts[idx].lower() if clean_opts and 0 <= idx < len(clean_opts) else None
+        return idx, text
+
+    return None, val_lower
+
+
+def _is_correct_answer(given: Any, ans: Any, opts: Any = None) -> bool:
     """Robustly check if student's given answer matches the correct option."""
     if given is None or str(given).strip() == "":
         return False
@@ -99,44 +133,19 @@ def _is_correct_answer(given: Any, ans: Any, opts: Any = None)-> bool:
     given_str = str(given).strip()
     ans_str = str(ans).strip() if ans is not None else ""
 
-    # 1. Direct string/numeric match
     if given_str.lower() == ans_str.lower():
         return True
 
-    # 2. Letter mapping ("A"/"a" -> "0", "B"/"b" -> "1", etc.)
-    letter_map = {
-        "a": "0", "b": "1", "c": "2", "d": "3",
-        "0": "0", "1": "1", "2": "2", "3": "3"
-    }
-    given_norm = letter_map.get(given_str.lower(), given_str.lower())
-    ans_norm = letter_map.get(ans_str.lower(), ans_str.lower())
+    given_idx, given_text = _resolve_option_index(given, opts)
+    ans_idx, ans_text = _resolve_option_index(ans, opts)
 
-    if given_norm == ans_norm:
+    # 1. Index match (0..3)
+    if given_idx is not None and ans_idx is not None:
+        return given_idx == ans_idx
+
+    # 2. Option text match
+    if given_text and ans_text and given_text == ans_text:
         return True
-
-    # 3. Option text matching if options list is provided
-    if opts and isinstance(opts, (list, tuple)):
-        try:
-            g_idx = int(given_norm)
-            if 0 <= g_idx < len(opts):
-                if str(opts[g_idx]).strip().lower() == ans_str.lower():
-                    return True
-        except (ValueError, TypeError):
-            pass
-
-        try:
-            a_idx = int(ans_norm)
-            if 0 <= a_idx < len(opts):
-                if str(opts[a_idx]).strip().lower() == given_str.lower():
-                    return True
-        except (ValueError, TypeError):
-            pass
-
-        for idx, opt in enumerate(opts):
-            opt_clean = str(opt).strip().lower()
-            if opt_clean == ans_str.lower():
-                if str(idx) == given_norm:
-                    return True
 
     return False
 

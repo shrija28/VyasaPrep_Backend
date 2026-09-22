@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from ..db.models import Exam, ExamSet, ExamSetQuestion, Question, Submission, Subject
+from ..db.models import Exam, ExamSet, ExamSetQuestion, Question, Submission, Subject, User
 from ..db.session import get_async_session as get_session
 from ..middleware.rbac import current_user, require_student
 from ..subscription.dependencies import get_access_control
@@ -266,6 +266,9 @@ def get_submission(submission_id: uuid.UUID)-> Any:
     answers = submission.answers if isinstance(submission.answers, dict) else {}
     from ..db.subscription_models import Subscription
     from ..submissions.scoring import _is_correct_answer
+    from ..rag.mcq_extractor import shuffle_options_for_set_label
+
+    set_label = exam_set.set_label if exam_set is not None else "A"
 
     sub = session.query(Subscription).options(joinedload(Subscription.plan)).filter(
         Subscription.user_id == user.id,
@@ -283,9 +286,11 @@ def get_submission(submission_id: uuid.UUID)-> Any:
         if q_time is None and isinstance(q_times, dict):
             q_time = q_times.get(int(order_index))
 
+        shuffled_opts, new_ans = shuffle_options_for_set_label(question.options or [], question.correct_option, set_label)
+
         if given is None or str(given).strip() == "":
             given_status = "unanswered"
-        elif _is_correct_answer(given, question.correct_option, question.options):
+        elif _is_correct_answer(given, new_ans, shuffled_opts):
             given_status = "correct"
         else:
             given_status = "wrong"
@@ -294,8 +299,8 @@ def get_submission(submission_id: uuid.UUID)-> Any:
                 "order_index": int(order_index),
                 "id": str(question.id),
                 "q": question.question_text,
-                "opts": question.options,
-                "correctAns": question.correct_option if is_premium else None,
+                "opts": shuffled_opts,
+                "correctAns": new_ans if is_premium else None,
                 "topic": question.topic or "General",
                 "given": given,
                 "status": given_status,
@@ -471,6 +476,8 @@ def get_dashboard_stats() -> Any:
             },
             "topStudents": top_students,
             "examHistory": [],
+            "recentSubmissions": [],
+            "recent_submissions": [],
             "has_data": False,
         })
 
@@ -748,6 +755,8 @@ def get_dashboard_stats() -> Any:
         },
         "topStudents": top_students,
         "examHistory": exam_history,
+        "recentSubmissions": exam_history,
+        "recent_submissions": exam_history,
         "has_data": True,
     })
 

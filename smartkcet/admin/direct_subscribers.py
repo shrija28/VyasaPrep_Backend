@@ -4,6 +4,7 @@ import os
 from typing import Annotated
 import os
 from flask import Blueprint, request, g, make_response, jsonify, Response
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from ..db.models import User

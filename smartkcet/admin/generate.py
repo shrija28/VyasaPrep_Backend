@@ -247,13 +247,16 @@ def generate() -> Any:
             q_text = mcq.get("q", "").strip()
             if not q_text:
                 continue
-            if not is_valid_question(q_text, mcq.get("opts", []), subject=subject_name):
+            opts = mcq.get("opts", [])
+            if not is_valid_question(q_text, opts, subject=subject_name):
                 continue
+            from ..rag.mcq_extractor import shuffle_question_options
+            shuffled_opts, new_ans = shuffle_question_options(opts, mcq.get("ans", 0))
             row = Question(
                 subject=subject_name,
                 question_text=q_text,
-                options=mcq.get("opts", []),
-                correct_option=str(mcq.get("ans", 0)),
+                options=shuffled_opts,
+                correct_option=str(new_ans),
                 topic=mcq.get("topic", subject_name),
                 generation_batch_id=batch_id,
                 institution_id=None,

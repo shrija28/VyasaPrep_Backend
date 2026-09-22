@@ -97,19 +97,9 @@ def shuffle_options_for_set_label(opts: List[str], ans: Any, set_label: str) -> 
     ]
 
     ans_str = str(ans).strip() if ans is not None else "0"
-    letter_map = {"a": 0, "b": 1, "c": 2, "d": 3, "0": 0, "1": 1, "2": 2, "3": 3}
+    from ..submissions.scoring import _resolve_option_index
 
-    current_idx = None
-    if ans_str.lower() in letter_map:
-        current_idx = letter_map[ans_str.lower()]
-    elif ans_str.isdigit() and 0 <= int(ans_str) < 4:
-        current_idx = int(ans_str)
-    else:
-        for idx, opt in enumerate(clean_opts):
-            if str(opt).lower() == ans_str.lower():
-                current_idx = idx
-                break
-
+    current_idx, _ = _resolve_option_index(ans, clean_opts)
     if current_idx is None or current_idx < 0 or current_idx >= 4:
         current_idx = 0
 
@@ -131,8 +121,30 @@ def shuffle_options_for_set_label(opts: List[str], ans: Any, set_label: str) -> 
 
 
 def shuffle_question_options(opts: List[str], ans: Any) -> tuple[List[str], str]:
-    """Alias for backwards compatibility using random option shuffling."""
-    return shuffle_options_for_set_label(opts, ans, "A")
+    """Randomly shuffles options and returns (shuffled_opts, new_ans_index_str).
+    Guarantees right options are randomly and uniformly distributed among A, B, C, or D (0, 1, 2, 3).
+    """
+    if not isinstance(opts, list) or len(opts) != 4:
+        return opts, str(ans) if ans is not None else "0"
+
+    clean_opts = [
+        re.sub(r"^\s*(?:\([A-Da-d1-4]\)|[A-Da-d1-4]\s*[.):\-]|option\s+[A-Da-d1-4]\s*[:\-]?)\s*", "", str(opt), flags=re.IGNORECASE).strip()
+        for opt in opts
+    ]
+
+    from ..submissions.scoring import _resolve_option_index
+    current_idx, _ = _resolve_option_index(ans, clean_opts)
+    if current_idx is None or current_idx < 0 or current_idx >= 4:
+        current_idx = 0
+
+    perm = [0, 1, 2, 3]
+    random.shuffle(perm)
+
+    shuffled_opts = [clean_opts[i] for i in perm]
+    new_ans_idx = perm.index(current_idx)
+
+    return shuffled_opts, str(new_ans_idx)
+
 
 
 def normalize_question_fingerprint(q_text: str) -> str:

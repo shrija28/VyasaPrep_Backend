@@ -574,29 +574,60 @@ def list_institutions(subscription_status: Optional[str] = None)-> InstitutionLi
 
 
 @router.route("/students", methods=["GET"])
-def list_students(student_type: Optional[str] = None,
-    institution_id: Optional[UUID] = None):    
+def list_students(student_type: Optional[str] = None, institution_id: Optional[UUID] = None):    
     from flask import g, request
+    from sqlalchemy import or_
+    from uuid import UUID
     db = getattr(g, "db", None)
 
-    st = request.args.get("student_type") or student_type
-    inst_id = request.args.get("institution_id") or institution_id
+    st = request.args.get("student_type") or request.args.get("type") or student_type
+    inst_id_raw = request.args.get("institution_id") or institution_id
+    inst_id = None
+    if inst_id_raw:
+        try:
+            inst_id = UUID(str(inst_id_raw))
+        except Exception:
+            inst_id = None
 
     from ..db.models import User
     from ..db.subscription_models import Subscription, Institution
     
+    # Compute overall platform summary KPI metrics across all students
+    all_students = db.query(User).filter(User.role == 'student').all()
+    total_students = len(all_students)
+    
+    inst_linked_count = sum(
+        1 for u in all_students
+        if u.institution_id is not None or u.student_subtype in ('institution_linked', 'dual')
+    )
+    direct_sub_count = sum(
+        1 for u in all_students
+        if u.institution_id is None or u.student_subtype in ('direct_subscriber', 'dual')
+    )
+    
+    active_sub_users = db.query(Subscription.user_id).filter(
+        Subscription.status.in_(["trial", "active", "overdue", "grace_period"])
+    ).all()
+    active_user_ids = {r[0] for r in active_sub_users if r[0]}
+    active_subs_count = sum(1 for u in all_students if u.id in active_user_ids)
+
+    # Build query for student table
     query = db.query(User).filter(User.role == 'student')
     
-    if st == 'direct':
-        query = query.filter(User.student_subtype.in_(['direct_subscriber', 'dual']))
-    elif st == 'institution':
-        query = query.filter(User.student_subtype.in_(['institution_linked', 'dual']))
+    if st in ('direct', 'direct_subscriber'):
+        query = query.filter(
+            or_(User.institution_id.is_(None), User.student_subtype.in_(['direct_subscriber', 'dual']))
+        )
+    elif st in ('institution', 'institution_linked'):
+        query = query.filter(
+            or_(User.institution_id.isnot(None), User.student_subtype.in_(['institution_linked', 'dual']))
+        )
         if inst_id:
             query = query.filter(User.institution_id == inst_id)
     elif inst_id:
         query = query.filter(User.institution_id == inst_id)
     
-    students = query.all()
+    students = query.order_by(User.created_at.desc()).all()
     
     students_data = []
     for user in students:
@@ -614,22 +645,62 @@ def list_students(student_type: Optional[str] = None,
             institution = db.query(Institution).filter(Institution.id == user.institution_id).first()
             institution_name = institution.name if institution else None
         
+        subtype_label = "Direct Subscriber"
+        if user.institution_id or user.student_subtype == "institution_linked":
+            subtype_label = "Institution-linked"
+        elif user.student_subtype == "dual":
+            subtype_label = "Dual"
+        
+        student_id_str = user.kcet_student_id or str(user.id)
+        joined_str = user.created_at.strftime("%Y-%m-%d") if user.created_at else "—"
+        joined_iso = user.created_at.isoformat() if user.created_at else None
+        
+        sub_status = subscription.status if subscription else ("active" if user.institution_id else "trial")
+
         students_data.append({
             "id": str(user.id),
-            "kcet_student_id": user.kcet_student_id,
-            "name": user.display_name,
+            "user_id": str(user.id),
+            "kcet_student_id": student_id_str,
+            "student_id": student_id_str,
+            "name": user.display_name or user.email,
+            "display_name": user.display_name or user.email,
             "email": user.email,
-            "student_subtype": user.student_subtype or "unknown",
+            "student_subtype": user.student_subtype or "direct_subscriber",
+            "type": subtype_label,
+            "subtype": subtype_label,
             "institution_id": str(user.institution_id) if user.institution_id else None,
-            "institution_name": institution_name,
-            "subscription_status": subscription.status if subscription else "no_subscription",
+            "institution_name": institution_name or "—",
+            "institution": institution_name or "—",
+            "subscription_status": sub_status,
+            "subscription": sub_status,
             "has_active_subscription": subscription is not None,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "created_at": joined_iso,
+            "joined_at": joined_iso,
+            "joined": joined_str,
         })
     
     return {
         "count": len(students_data),
+        "total": total_students,
+        "total_students": total_students,
+        "totalStudents": total_students,
+        "institution_linked": inst_linked_count,
+        "institutionLinked": inst_linked_count,
+        "institution_students": inst_linked_count,
+        "direct_subscribers": direct_sub_count,
+        "directSubscribers": direct_sub_count,
+        "direct_students": direct_sub_count,
+        "active_subscriptions": active_subs_count,
+        "activeSubscriptions": active_subs_count,
+        "active_subscriptions_count": active_subs_count,
+        "summary": {
+            "total_students": total_students,
+            "institution_linked": inst_linked_count,
+            "direct_subscribers": direct_sub_count,
+            "active_subscriptions": active_subs_count,
+        },
         "students": students_data,
+        "data": students_data,
     }
 
 
