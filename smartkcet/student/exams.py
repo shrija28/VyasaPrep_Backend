@@ -180,6 +180,15 @@ def list_published_exams()-> Any:
         for es in sets_rows:
             all_exam_sets.setdefault(es.exam_id, []).append(es)
 
+    # Fetch all completed submissions for the current student to enforce single attempt visibility
+    from ..db.models import Submission
+    completed_sub_rows = session.execute(
+        select(Submission.id, ExamSet.exam_id)
+        .join(ExamSet, Submission.exam_set_id == ExamSet.id)
+        .where(Submission.user_id == user.id, Submission.status == "completed")
+    ).all() if user else []
+    attempted_exam_map = {row[1]: str(row[0]) for row in completed_sub_rows}
+
     buckets: dict[str, list[dict[str, Any]]] = {}
     for exam, set_count in rows:
         created_at = exam.created_at
@@ -223,6 +232,9 @@ def list_published_exams()-> Any:
             except Exception:
                 actual_q_count = 60
 
+        is_attempted = exam.id in attempted_exam_map
+        submission_id = attempted_exam_map.get(exam.id)
+
         bucket = buckets.setdefault(exam.subject, [])
         bucket.append(
             {
@@ -241,6 +253,9 @@ def list_published_exams()-> Any:
                 "assigned_set_id": assigned_set.get("exam_set_id"),
                 "assigned_set_label": assigned_set.get("set_label"),
                 "sets": sets_payload,
+                "attempted": is_attempted,
+                "can_attempt": not is_attempted,
+                "submission_id": submission_id,
             }
         )
 
@@ -329,13 +344,34 @@ def get_exam_set_questions(exam_set_id: str)-> Any:
         student_subtype = "institution_linked"
 
     if student_subtype == "institution_linked" and student_institution_id is not None:
-        # Must belong to their institution OR be platform-wide admin exam
-        if exam.institution_id is not None and str(exam.institution_id) != str(student_institution_id):
+        # Institution student MUST access strictly their institution's exam (not platform admin or other institution)
+        if exam.institution_id is None or str(exam.institution_id) != str(student_institution_id):
             return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
     else:
         # Direct subscriber: platform-wide admin exam only
         if exam.institution_id is not None:
             return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
+
+    # ── Single Attempt Enforcement ──────────────────────────────────────────
+    if user:
+        from ..db.models import Submission
+        existing_sub = session.execute(
+            select(Submission.id)
+            .join(ExamSet, Submission.exam_set_id == ExamSet.id)
+            .where(
+                Submission.user_id == user.id,
+                ExamSet.exam_id == exam.id,
+                Submission.status == "completed"
+            )
+        ).scalar_one_or_none()
+
+        if existing_sub:
+            return make_response(jsonify({
+                "error": "already_attempted",
+                "error_code": "already_attempted",
+                "message": "You have already completed this exam. Each exam can only be taken once.",
+                "submission_id": str(existing_sub)
+            }), 403)
 
     # Load questions ordered by position (fixed & immutable for this published exam set)
     stmt = (

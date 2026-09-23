@@ -37,6 +37,8 @@ router = Blueprint("student_exam_access", __name__)
 class CheckAccessRequest(BaseModel):
     subject: Optional[str] = None
     set: Optional[str] = None
+    exam_id: Optional[str] = None
+    exam_set_id: Optional[str] = None
 
 
 @router.route("/check-access", methods=["POST"])
@@ -55,6 +57,47 @@ def check_exam_access()-> Any:
     user = current_user(request, session)
     if user is None:
         return make_response(jsonify({"error": "auth_required", "message": "Authentication required."}), 401)
+
+    # ── Single Attempt Verification ──────────────────────────────────────────
+    body_json = request.get_json(silent=True) or {}
+    target_exam_id = body_json.get("exam_id")
+    target_set_id = body_json.get("exam_set_id")
+
+    if target_set_id and not target_exam_id:
+        try:
+            import uuid
+            from ..db.models import ExamSet
+            es_obj = session.get(ExamSet, uuid.UUID(str(target_set_id)))
+            if es_obj:
+                target_exam_id = str(es_obj.exam_id)
+        except Exception:
+            pass
+
+    if target_exam_id:
+        try:
+            import uuid
+            from sqlalchemy import select
+            from ..db.models import Submission, ExamSet
+            target_uuid = uuid.UUID(str(target_exam_id))
+            existing_sub = session.execute(
+                select(Submission.id)
+                .join(ExamSet, Submission.exam_set_id == ExamSet.id)
+                .where(
+                    Submission.user_id == user.id,
+                    ExamSet.exam_id == target_uuid,
+                    Submission.status == "completed"
+                )
+            ).scalar_one_or_none()
+
+            if existing_sub:
+                return make_response(jsonify({
+                    "error_code": "already_attempted",
+                    "error": "already_attempted",
+                    "message": "You have already completed this exam. Each exam can only be taken once.",
+                    "submission_id": str(existing_sub),
+                }), 403)
+        except Exception:
+            pass
 
     # ── Resolve effective subscription ───────────────────────────────────────
     from ..subscription.service import SubscriptionService

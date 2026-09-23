@@ -289,6 +289,24 @@ def submit()-> Any:
         if exam.institution_id is not None:
             return make_response(jsonify({"error": "not_found", "message": "Exam is not available"}), 404)
 
+    # ── Single Attempt Enforcement ──────────────────────────────────────────
+    prev_sub = session.execute(
+        select(Submission.id)
+        .join(ExamSet, Submission.exam_set_id == ExamSet.id)
+        .where(
+            Submission.user_id == user.id,
+            ExamSet.exam_id == exam.id,
+            Submission.status == "completed"
+        )
+    ).scalar_one_or_none()
+    if prev_sub is not None:
+        return make_response(jsonify({
+            "error": "already_attempted",
+            "error_code": "already_attempted",
+            "message": "You have already submitted this exam. Each exam can only be taken once.",
+            "submission_id": str(prev_sub)
+        }), 403)
+
     questions = _load_exam_set_questions(session, exam_set_id)
     if not questions:
         return make_response(jsonify({
