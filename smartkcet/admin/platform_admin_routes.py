@@ -491,19 +491,14 @@ def remove_institution(institution_id: UUID)-> SuccessResponse:
 
 @router.route("/institutions", methods=["GET"])
 def list_institutions(subscription_status: Optional[str] = None)-> InstitutionListResponse:    
-    from flask import g
+    from flask import g, request
     db = getattr(g, "db", None)
-    session = db
-    
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
     """List all institutions with optional filters.
     
     Requires Platform Admin authentication.
     """
     from ..db.models import User, Question, Exam
-    from ..db.subscription_models import Subscription, Institution
+    from ..db.subscription_models import Subscription, SubscriptionPlan, Institution
     from sqlalchemy import func
     
     query = db.query(Institution)
@@ -513,41 +508,55 @@ def list_institutions(subscription_status: Optional[str] = None)-> InstitutionLi
         query = query.filter(Institution.subscription_status == status)
     
     institutions = query.all()
+    if not institutions:
+        return InstitutionListResponse(institutions=[], total=0)
     
-    # Build response with additional data
+    inst_ids = [inst.id for inst in institutions]
+
+    # Batched Subscription + SubscriptionPlan lookup in 1 SQL query
+    sub_rows = (
+        db.query(
+            Subscription.institution_id,
+            Subscription.next_renewal_date,
+            SubscriptionPlan.name.label("plan_name")
+        )
+        .filter(Subscription.institution_id.in_(inst_ids))
+        .outerjoin(SubscriptionPlan, SubscriptionPlan.id == Subscription.plan_id)
+        .all()
+    )
+    sub_map = {r[0]: (r[1], r[2]) for r in sub_rows if r[0]}
+
+    # Grouped SQL aggregate student counts in 1 SQL query
+    student_counts = dict(
+        db.query(User.institution_id, func.count(User.id))
+        .filter(User.role == 'student', User.institution_id.in_(inst_ids))
+        .group_by(User.institution_id)
+        .all()
+    )
+
+    # Grouped SQL aggregate question counts in 1 SQL query
+    question_counts = dict(
+        db.query(Question.institution_id, func.count(Question.id))
+        .filter(Question.institution_id.in_(inst_ids))
+        .group_by(Question.institution_id)
+        .all()
+    )
+
+    # Grouped SQL aggregate exam counts in 1 SQL query
+    exam_counts = dict(
+        db.query(Exam.institution_id, func.count(Exam.id))
+        .filter(Exam.institution_id.in_(inst_ids))
+        .group_by(Exam.institution_id)
+        .all()
+    )
+
+    # Build response array with zero per-institution DB queries
     inst_responses = []
     for inst in institutions:
-        # Get subscription info
-        subscription = (
-            db.query(Subscription)
-            .filter(Subscription.institution_id == inst.id)
-            .first()
-        )
-        
-        # Get plan name from subscription
-        plan_name = None
-        if subscription and subscription.plan_id:
-            from ..db.subscription_models import SubscriptionPlan
-            plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == subscription.plan_id).first()
-            if plan:
-                plan_name = plan.name
-        
-        # Get student count
-        student_count = db.query(func.count(User.id)).filter(
-            User.institution_id == inst.id,
-            User.role == 'student'
-        ).scalar() or 0
-        
-        # Get question count
-        question_count = db.query(func.count(Question.id)).filter(
-            Question.institution_id == inst.id
-        ).scalar() or 0
-        
-        # Get exam count
-        exam_count = db.query(func.count(Exam.id)).filter(
-            Exam.institution_id == inst.id
-        ).scalar() or 0
-        
+        sub_info = sub_map.get(inst.id)
+        next_renewal = sub_info[0] if sub_info else None
+        plan_name = sub_info[1] if sub_info else None
+
         inst_responses.append(InstitutionResponse(
             id=str(inst.id),
             name=inst.name,
@@ -555,11 +564,11 @@ def list_institutions(subscription_status: Optional[str] = None)-> InstitutionLi
             contact_phone=inst.contact_phone,
             subscription_status=inst.subscription_status,
             registered_at=inst.registered_at.isoformat() if inst.registered_at else None,
-            student_count=int(student_count),
-            question_count=int(question_count),
-            exam_count=int(exam_count),
+            student_count=int(student_counts.get(inst.id, 0)),
+            question_count=int(question_counts.get(inst.id, 0)),
+            exam_count=int(exam_counts.get(inst.id, 0)),
             plan_name=plan_name,
-            next_renewal_date=subscription.next_renewal_date.isoformat() if subscription and subscription.next_renewal_date else None,
+            next_renewal_date=next_renewal.isoformat() if next_renewal else None,
         ))
     
     return InstitutionListResponse(
@@ -576,7 +585,7 @@ def list_institutions(subscription_status: Optional[str] = None)-> InstitutionLi
 @router.route("/students", methods=["GET"])
 def list_students(student_type: Optional[str] = None, institution_id: Optional[UUID] = None):    
     from flask import g, request
-    from sqlalchemy import or_
+    from sqlalchemy import or_, func, select
     from uuid import UUID
     db = getattr(g, "db", None)
 
@@ -592,59 +601,63 @@ def list_students(student_type: Optional[str] = None, institution_id: Optional[U
     from ..db.models import User
     from ..db.subscription_models import Subscription, Institution
     
-    # Compute overall platform summary KPI metrics across all students
-    all_students = db.query(User).filter(User.role == 'student').all()
-    total_students = len(all_students)
+    # Fast SQL aggregate counts for platform summary KPI metrics
+    total_students = db.query(func.count(User.id)).filter(User.role == 'student').scalar() or 0
     
-    inst_linked_count = sum(
-        1 for u in all_students
-        if u.institution_id is not None or u.student_subtype in ('institution_linked', 'dual')
-    )
-    direct_sub_count = sum(
-        1 for u in all_students
-        if u.institution_id is None or u.student_subtype in ('direct_subscriber', 'dual')
-    )
+    inst_linked_count = db.query(func.count(User.id)).filter(
+        User.role == 'student',
+        or_(User.institution_id.isnot(None), User.student_subtype.in_(['institution_linked', 'dual']))
+    ).scalar() or 0
     
-    active_sub_users = db.query(Subscription.user_id).filter(
+    direct_sub_count = db.query(func.count(User.id)).filter(
+        User.role == 'student',
+        or_(User.institution_id.is_(None), User.student_subtype.in_(['direct_subscriber', 'dual']))
+    ).scalar() or 0
+    
+    active_subs_count = db.query(func.count(func.distinct(User.id))).join(
+        Subscription, Subscription.user_id == User.id
+    ).filter(
+        User.role == 'student',
         Subscription.status.in_(["trial", "active", "overdue", "grace_period"])
-    ).all()
-    active_user_ids = {r[0] for r in active_sub_users if r[0]}
-    active_subs_count = sum(1 for u in all_students if u.id in active_user_ids)
+    ).scalar() or 0
 
-    # Build query for student table
-    query = db.query(User).filter(User.role == 'student')
+    # Single joined query to fetch students and their institution names in one go
+    query = select(User, Institution.name.label("institution_name")).outerjoin(
+        Institution, Institution.id == User.institution_id
+    ).where(User.role == 'student')
     
     if st in ('direct', 'direct_subscriber'):
-        query = query.filter(
+        query = query.where(
             or_(User.institution_id.is_(None), User.student_subtype.in_(['direct_subscriber', 'dual']))
         )
     elif st in ('institution', 'institution_linked'):
-        query = query.filter(
+        query = query.where(
             or_(User.institution_id.isnot(None), User.student_subtype.in_(['institution_linked', 'dual']))
         )
         if inst_id:
-            query = query.filter(User.institution_id == inst_id)
+            query = query.where(User.institution_id == inst_id)
     elif inst_id:
-        query = query.filter(User.institution_id == inst_id)
+        query = query.where(User.institution_id == inst_id)
     
-    students = query.order_by(User.created_at.desc()).all()
+    rows = db.execute(query.order_by(User.created_at.desc())).all()
     
+    # Batched subscription lookup for all fetched students in a single query
+    student_ids = [user.id for user, _ in rows]
+    user_sub_map: dict[UUID, str] = {}
+    if student_ids:
+        sub_rows = db.query(Subscription.user_id, Subscription.status).filter(
+            Subscription.user_id.in_(student_ids),
+            Subscription.status.in_(["trial", "active", "overdue", "grace_period"])
+        ).all()
+        for uid, status in sub_rows:
+            if uid and uid not in user_sub_map:
+                user_sub_map[uid] = status
+
     students_data = []
-    for user in students:
-        subscription = (
-            db.query(Subscription)
-            .filter(
-                Subscription.user_id == user.id,
-                Subscription.status.in_(["trial", "active", "overdue", "grace_period"])
-            )
-            .first()
-        )
-        
-        institution_name = None
-        if user.institution_id:
-            institution = db.query(Institution).filter(Institution.id == user.institution_id).first()
-            institution_name = institution.name if institution else None
-        
+    for user, institution_name in rows:
+        active_sub_status = user_sub_map.get(user.id)
+        has_active_sub = active_sub_status is not None
+
         subtype_label = "Direct Subscriber"
         if user.institution_id or user.student_subtype == "institution_linked":
             subtype_label = "Institution-linked"
@@ -655,7 +668,7 @@ def list_students(student_type: Optional[str] = None, institution_id: Optional[U
         joined_str = user.created_at.strftime("%Y-%m-%d") if user.created_at else "—"
         joined_iso = user.created_at.isoformat() if user.created_at else None
         
-        sub_status = subscription.status if subscription else ("active" if user.institution_id else "trial")
+        sub_status = active_sub_status if has_active_sub else ("active" if user.institution_id else "trial")
 
         students_data.append({
             "id": str(user.id),
@@ -673,7 +686,7 @@ def list_students(student_type: Optional[str] = None, institution_id: Optional[U
             "institution": institution_name or "—",
             "subscription_status": sub_status,
             "subscription": sub_status,
-            "has_active_subscription": subscription is not None,
+            "has_active_subscription": has_active_sub,
             "created_at": joined_iso,
             "joined_at": joined_iso,
             "joined": joined_str,

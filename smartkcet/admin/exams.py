@@ -776,10 +776,13 @@ def list_exams() -> Any:
             )
         selected = normalised
 
+    from ..db.subscription_models import Institution
+
     stmt = (
-        select(Exam, func.count(ExamSet.id).label("set_count"))
+        select(Exam, Institution.name.label("institution_name"), func.count(ExamSet.id).label("set_count"))
+        .outerjoin(Institution, Institution.id == Exam.institution_id)
         .outerjoin(ExamSet, ExamSet.exam_id == Exam.id)
-        .group_by(Exam.id)
+        .group_by(Exam.id, Institution.name)
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
 
@@ -791,7 +794,6 @@ def list_exams() -> Any:
             try:
                 inst_uuid = uuid.UUID(inst_id)
             except ValueError:
-                from ..db.subscription_models import Institution
                 inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
                 inst_uuid = inst_obj.id if inst_obj else None
             if inst_uuid:
@@ -802,8 +804,9 @@ def list_exams() -> Any:
 
     rows = session.execute(stmt).all()
     exams_payload: list[dict[str, Any]] = []
-    for exam, set_count in rows:
+    for exam, inst_name, set_count in rows:
         created_at = exam.created_at
+        is_inst = exam.institution_id is not None
         exams_payload.append(
             {
                 "exam_id": str(exam.id),
@@ -812,6 +815,9 @@ def list_exams() -> Any:
                 "created_at": created_at.isoformat() if created_at is not None else None,
                 "is_published": bool(exam.is_published),
                 "set_count": int(set_count or 0),
+                "institution_id": str(exam.institution_id) if is_inst else None,
+                "institution_name": inst_name if is_inst else None,
+                "owner_type": "institution" if is_inst else "admin",
             }
         )
 

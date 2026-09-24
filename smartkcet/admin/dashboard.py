@@ -44,39 +44,41 @@ def get_admin_dashboard()-> Any:
 
     now = datetime.utcnow()
     soon = now + timedelta(days=30)
+    from sqlalchemy import case
 
-    # ── Institutions ─────────────────────────────────────────────────────────
-    total_institutions = session.execute(
-        select(func.count(Institution.id))
-    ).scalar_one()
-
-    active_institutions = session.execute(
-        select(func.count(Institution.id)).where(
-            Institution.subscription_status.in_(["active", "trial", "overdue", "grace_period"])
+    # ── 1. Institutions Aggregation ───────────────────────────────────────────
+    inst_agg = session.execute(
+        select(
+            func.count(Institution.id),
+            func.count(case((Institution.subscription_status.in_(["active", "trial", "overdue", "grace_period"]), 1))),
+            func.count(case((Institution.subscription_status == "inactive", 1)))
         )
-    ).scalar_one()
+    ).one()
+    total_institutions = inst_agg[0] or 0
+    active_institutions = inst_agg[1] or 0
+    inactive_count = inst_agg[2] or 0
 
-    # ── Users / Students ──────────────────────────────────────────────────────
-    total_students = session.execute(
-        select(func.count(User.id)).where(User.role == "student")
-    ).scalar_one()
-
-    institution_linked_students = session.execute(
-        select(func.count(User.id)).where(
-            User.role == "student",
-            User.institution_id.isnot(None),
-        )
-    ).scalar_one()
-
+    # ── 2. Users / Students Aggregation ───────────────────────────────────────
+    user_agg = session.execute(
+        select(
+            func.count(User.id),
+            func.count(User.institution_id)
+        ).where(User.role == "student")
+    ).one()
+    total_students = user_agg[0] or 0
+    institution_linked_students = user_agg[1] or 0
     direct_students = total_students - institution_linked_students
 
-    # ── Questions ─────────────────────────────────────────────────────────────
-    # Admin (platform-wide) questions — institution_id IS NULL
-    admin_questions_total = session.execute(
-        select(func.count(Question.id)).where(Question.institution_id.is_(None))
-    ).scalar_one()
+    # ── 3. Questions Aggregation ──────────────────────────────────────────────
+    q_agg = session.execute(
+        select(
+            func.count(case((Question.institution_id.is_(None), 1))),
+            func.count(Question.institution_id)
+        )
+    ).one()
+    admin_questions_total = q_agg[0] or 0
+    institution_questions_total = q_agg[1] or 0
 
-    # Per-subject admin questions
     admin_q_by_subject = dict(
         session.execute(
             select(Question.subject, func.count(Question.id))
@@ -85,12 +87,6 @@ def get_admin_dashboard()-> Any:
         ).all()
     )
 
-    # Institution questions — institution_id IS NOT NULL
-    institution_questions_total = session.execute(
-        select(func.count(Question.id)).where(Question.institution_id.isnot(None))
-    ).scalar_one()
-
-    # Per-institution question counts
     inst_q_rows = session.execute(
         select(Institution.name, func.count(Question.id))
         .join(Question, Question.institution_id == Institution.id)
@@ -100,22 +96,16 @@ def get_admin_dashboard()-> Any:
     ).all()
     institution_question_counts = [{"name": r[0], "count": r[1]} for r in inst_q_rows]
 
-    # ── Exams ─────────────────────────────────────────────────────────────────
-    total_exams = session.execute(select(func.count(Exam.id))).scalar_one()
-    published_exams = session.execute(
-        select(func.count(Exam.id)).where(Exam.is_published.is_(True))
-    ).scalar_one()
+    # ── 4. Exams Aggregation ──────────────────────────────────────────────────
+    exam_agg = session.execute(
+        select(
+            func.count(Exam.id),
+            func.count(case((Exam.is_published.is_(True), 1)))
+        )
+    ).one()
+    total_exams = exam_agg[0] or 0
+    published_exams = exam_agg[1] or 0
 
-    # Total exam attempts (submissions)
-    total_attempts = session.execute(select(func.count(Submission.id))).scalar_one()
-
-    # Average score across all completed submissions
-    avg_score_result = session.execute(
-        select(func.avg(Submission.score_pct)).where(Submission.status == "completed")
-    ).scalar_one()
-    avg_score = round(float(avg_score_result or 0), 1)
-
-    # Exams by subject
     exams_by_subject = dict(
         session.execute(
             select(Exam.subject, func.count(Exam.id))
@@ -123,26 +113,28 @@ def get_admin_dashboard()-> Any:
         ).all()
     )
 
-    # ── Subscriptions ─────────────────────────────────────────────────────────
-    active_subscriptions = session.execute(
-        select(func.count(Subscription.id)).where(
-            Subscription.status.in_(["active", "trial", "grace_period"])
+    # ── 5. Submissions Aggregation ────────────────────────────────────────────
+    subm_agg = session.execute(
+        select(
+            func.count(Submission.id),
+            func.avg(case((Submission.status == "completed", Submission.score_pct)))
         )
-    ).scalar_one()
+    ).one()
+    total_attempts = subm_agg[0] or 0
+    avg_score = round(float(subm_agg[1] or 0), 1)
 
-    expired_subscriptions = session.execute(
-        select(func.count(Subscription.id)).where(
-            Subscription.status.in_(["expired", "cancelled"])
+    # ── 6. Subscriptions Aggregation ──────────────────────────────────────────
+    sub_agg = session.execute(
+        select(
+            func.count(case((Subscription.status.in_(["active", "trial", "grace_period"]), 1))),
+            func.count(case((Subscription.status.in_(["expired", "cancelled"]), 1))),
+            func.count(case((Subscription.status == "overdue", 1)))
         )
-    ).scalar_one()
+    ).one()
+    active_subscriptions = sub_agg[0] or 0
+    expired_subscriptions = sub_agg[1] or 0
+    overdue_subscriptions = sub_agg[2] or 0
 
-    overdue_subscriptions = session.execute(
-        select(func.count(Subscription.id)).where(
-            Subscription.status == "overdue"
-        )
-    ).scalar_one()
-
-    # Institution subscriptions detail (for subscriptions page)
     inst_sub_rows = session.execute(
         select(
             Institution.id,
@@ -207,13 +199,6 @@ def get_admin_dashboard()-> Any:
             "days_left": days_left,
         })
 
-    # Inactive institutions (no subscription at all)
-    inactive_count = session.execute(
-        select(func.count(Institution.id)).where(
-            Institution.subscription_status == "inactive"
-        )
-    ).scalar_one()
-
     if inactive_count > 0:
         alerts.append({
             "type": "inactive_institutions",
@@ -222,7 +207,7 @@ def get_admin_dashboard()-> Any:
             "count": int(inactive_count),
         })
 
-    # ── Recent institutions (last 5) ──────────────────────────────────────────
+    # ── 7. Recent Institutions ────────────────────────────────────────────────
     recent_inst_rows = session.execute(
         select(
             Institution.id,
@@ -244,16 +229,17 @@ def get_admin_dashboard()-> Any:
         for r in recent_inst_rows
     ]
 
-    # ── Indexed files ─────────────────────────────────────────────────────────
-    admin_files = session.execute(
-        select(func.count(IndexedFile.id)).where(IndexedFile.institution_id.is_(None))
-    ).scalar_one()
+    # ── 8. Indexed Files Aggregation ──────────────────────────────────────────
+    file_agg = session.execute(
+        select(
+            func.count(case((IndexedFile.institution_id.is_(None), 1))),
+            func.count(IndexedFile.institution_id)
+        )
+    ).one()
+    admin_files = file_agg[0] or 0
+    institution_files = file_agg[1] or 0
 
-    institution_files = session.execute(
-        select(func.count(IndexedFile.id)).where(IndexedFile.institution_id.isnot(None))
-    ).scalar_one()
-
-    # ── Direct students list ──────────────────────────────────────────────────
+    # ── 9. Direct Students List (Batched Subscription Lookup) ─────────────────
     direct_student_rows = session.execute(
         select(User.id, User.display_name, User.email, User.kcet_student_id, User.created_at)
         .where(User.role == "student", User.institution_id.is_(None))
@@ -261,42 +247,63 @@ def get_admin_dashboard()-> Any:
         .limit(20)
     ).all()
 
-    direct_students_list = []
-    for r in direct_student_rows:
-        sub = session.execute(
-            select(Subscription.status)
-            .where(Subscription.user_id == r[0])
+    direct_student_ids = [r[0] for r in direct_student_rows]
+    user_sub_map = {}
+    if direct_student_ids:
+        sub_rows = session.execute(
+            select(Subscription.user_id, Subscription.status)
+            .where(Subscription.user_id.in_(direct_student_ids))
             .order_by(Subscription.created_at.desc())
-        ).scalars().first()
-        direct_students_list.append({
+        ).all()
+        for uid, sub_stat in sub_rows:
+            if uid not in user_sub_map:
+                user_sub_map[uid] = sub_stat
+
+    direct_students_list = [
+        {
             "id": str(r[0]),
             "name": r[1] or "—",
             "email": r[2],
             "kcet_student_id": r[3] or "—",
-            "subscription_status": sub if sub else "active",
+            "subscription_status": user_sub_map.get(r[0]) or "active",
             "created_at": r[4].isoformat() if r[4] else None,
-        })
+        }
+        for r in direct_student_rows
+    ]
 
-    # ── Recent activity (submissions, registrations) ──────────────────────────
+    # ── 10. Recent Activity (Optimized Joined Queries) ────────────────────────
     recent_activity = []
-    recent_subms = session.execute(
-        select(Submission)
+    recent_subm_rows = session.execute(
+        select(
+            Submission.id,
+            Submission.score_pct,
+            Submission.time_taken_sec,
+            Submission.submitted_at,
+            User.display_name,
+            Exam.exam_name,
+            Exam.subject
+        )
+        .outerjoin(User, User.id == Submission.user_id)
+        .outerjoin(ExamSet, ExamSet.id == Submission.exam_set_id)
+        .outerjoin(Exam, Exam.id == ExamSet.exam_id)
         .order_by(Submission.submitted_at.desc())
         .limit(6)
-    ).scalars().all()
-    for s in recent_subms:
-        u_name = s.user.display_name if s.user else "Student"
-        exam_title = s.exam_set.exam.exam_name or s.exam_set.exam.subject if s.exam_set and s.exam_set.exam else "Exam"
-        mins = s.time_taken_sec // 60 if s.time_taken_sec else 0
-        secs = s.time_taken_sec % 60 if s.time_taken_sec else 0
+    ).all()
+
+    for s_id, s_score, s_time, s_at, u_name, e_name, e_subj in recent_subm_rows:
+        user_name = u_name or "Student"
+        exam_title = e_name or e_subj or "Exam"
+        mins = (s_time or 0) // 60
+        secs = (s_time or 0) % 60
+        score_pct = float(s_score or 0)
         recent_activity.append({
-            "id": str(s.id),
+            "id": str(s_id),
             "type": "exam_submission",
-            "title": f"{u_name} completed {exam_title}",
-            "subtitle": f"Score: {s.score_pct}% ({mins}m {secs}s)",
-            "timestamp": s.submitted_at.isoformat() if s.submitted_at else None,
+            "title": f"{user_name} completed {exam_title}",
+            "subtitle": f"Score: {score_pct}% ({mins}m {secs}s)",
+            "timestamp": s_at.isoformat() if s_at else None,
             "badge": "Exam",
-            "badge_color": "green" if s.score_pct >= 50 else "blue",
+            "badge_color": "green" if score_pct >= 50 else "blue",
         })
 
     recent_users = session.execute(
