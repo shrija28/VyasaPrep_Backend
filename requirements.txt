@@ -24,7 +24,7 @@ faiss-cpu==1.13.2
 numpy<2
 
 # Document parsing / OCR
-opencv-python-headless==4.8.1.78
+# opencv-python-headless removed — cv2 preprocessing replaced with Pillow (saves ~90 MB)
 Pillow>=12.0.0
 pytesseract==0.3.10
 python-docx==0.8.11
@@ -47,7 +47,5 @@ supabase>=2.0.0
 python-dotenv==1.0.0
 setuptools<81
 
-# Tests (not needed in production)
-hypothesis>=6.92.0
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
+# Tests omitted from deployment bundle — run locally or in CI only
+# hypothesis, pytest, pytest-asyncio removed (~8 MB saved)
